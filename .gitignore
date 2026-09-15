@@ -1,0 +1,15 @@
+inventories/production/
+inventories/local/
+inventories/discovery/
+.env
+.env.*
+!.env.example
+*.retry
+*.key
+*.pem
+*.pgpass
+.vault-pass*
+__pycache__/
+.venv/
+artifacts/
+*.cfg.*
