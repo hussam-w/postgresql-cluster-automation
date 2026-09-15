@@ -19,7 +19,6 @@ Configuration-driven PostgreSQL automation for **Ubuntu 22.04 amd64 and configur
 | [Safe re-execution](docs/safe-reexecution.md) | Discovery, approved reload plans, preservation and maintenance gates |
 | [Administrator guide](docs/operator-guide.md) / [runbook](docs/operations.md) | Detailed HA configuration, operation and recovery |
 | [Repository structure](docs/project-structure.md) | Actual files, entry points and ownership |
-| [Validation](docs/validation.md) | Measured evidence and qualification limits |
 
 ## Supported modes and capabilities
 
