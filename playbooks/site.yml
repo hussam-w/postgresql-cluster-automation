@@ -1,0 +1,28 @@
+---
+- name: Use explicit architecture-driven workflow when selected
+  ansible.builtin.import_playbook: postgresql.yml
+  when: postgresql_deployment is defined
+
+- name: Validate safe routine execution mode
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Default to observation and reject unknown modes
+      ansible.builtin.assert:
+        that: execution_mode | default('plan') in ['plan', 'reconcile', 'fresh']
+        fail_msg: 'Supported modes are plan (default), reconcile (approved reload settings), and fresh (guarded provisioning).'
+
+- name: Observe any existing environment without a deployment contract
+  ansible.builtin.import_playbook: inspect.yml
+  when: postgresql_deployment is not defined and execution_mode | default('plan') == 'plan'
+
+- name: Reconcile explicitly approved settings with existing resource ownership
+  ansible.builtin.import_playbook: reconcile.yml
+  when: postgresql_deployment is not defined and execution_mode | default('plan') == 'reconcile'
+
+- name: Use the separately guarded fresh provisioning implementation
+  ansible.builtin.import_playbook: provision-cluster.yml
+  when: postgresql_deployment is not defined and execution_mode | default('plan') == 'fresh'

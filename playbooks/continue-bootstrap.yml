@@ -1,0 +1,10 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: continue-bootstrap
+
+- name: Coordinate active package maintenance
+  ansible.builtin.import_playbook: package-maintenance.yml
+- name: Continue validated bootstrap
+  ansible.builtin.import_playbook: bootstrap.yml

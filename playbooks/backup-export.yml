@@ -1,0 +1,122 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: backup-export
+
+- name: Export a quiesced encrypted repository to the protected controller
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Validate explicit export identity and native controller destination
+      ansible.builtin.assert:
+        that:
+          - backup_export_confirmation | default('') == 'EXPORT ENCRYPTED REPOSITORY'
+          - export_id is match('^[a-z0-9-]+$')
+          - export_controller_dir is match('^/home/[^/]+/\.local/share/pg-ha/exports$')
+      run_once: true
+    - name: Create protected export staging directory
+      ansible.builtin.file:
+        path: /var/lib/pg-ha-exports
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: inventory_hostname == backup_repository_host
+    - name: Refuse to replace an earlier export
+      ansible.builtin.stat:
+        path: '/var/lib/pg-ha-exports/{{ export_id }}.tar'
+      register: prior_export
+      when: inventory_hostname == backup_repository_host
+    - name: Require a fresh export filename
+      ansible.builtin.assert:
+        that: not prior_export.stat.exists
+      when: inventory_hostname == backup_repository_host
+    - name: Schedule archival recovery even if the controller disconnects
+      ansible.builtin.command:
+        argv: [systemd-run, '--unit=pg-ha-export-{{ export_id }}', --on-active=90s, --timer-property=AccuracySec=1s, --uid=postgres, /usr/bin/pgbackrest, '--stanza={{ cluster.name }}', start]
+    - name: Briefly quiesce repository mutations while copying ciphertext
+      block:
+        - name: Prevent new pgBackRest work without terminating running commands
+          ansible.builtin.command:
+            argv: [pgbackrest, '--stanza={{ cluster.name }}', stop]
+          become_user: postgres
+        - name: Wait for existing repository writers to finish
+          ansible.builtin.command:
+            argv: [pgrep, -f, 'pgbackrest.*(archive-push|backup |expire|stanza-create|stanza-upgrade)']
+          register: export_writers
+          changed_when: false
+          failed_when: export_writers.rc not in [0, 1]
+          retries: 15
+          delay: 2
+          until: export_writers.rc == 1
+        - name: Copy the encrypted repository within the bounded pause
+          ansible.builtin.command:
+            argv: [timeout, '30', tar, -C, '{{ backup_repository_path }}', -cf, '/var/lib/pg-ha-exports/{{ export_id }}.tar', .]
+          become_user: postgres
+          when: inventory_hostname == backup_repository_host
+      always:
+        - name: Resume normal archiving on every node
+          ansible.builtin.command:
+            argv: [pgbackrest, '--stanza={{ cluster.name }}', start]
+          become_user: postgres
+        - name: Cancel the fallback only after archival admission is restored
+          ansible.builtin.systemd_service:
+            name: 'pg-ha-export-{{ export_id }}.timer'
+            state: stopped
+    - name: Restrict staged archive permissions
+      ansible.builtin.file:
+        path: '/var/lib/pg-ha-exports/{{ export_id }}.tar'
+        mode: '0600'
+      when: inventory_hostname == backup_repository_host
+    - name: Create protected controller export storage
+      ansible.builtin.file:
+        path: '{{ export_controller_dir }}'
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+      run_once: true
+    - name: Transfer only encrypted repository contents over verified SSH
+      ansible.builtin.fetch:
+        src: '/var/lib/pg-ha-exports/{{ export_id }}.tar'
+        dest: '{{ export_controller_dir }}/{{ export_id }}.tar'
+        flat: true
+        validate_checksum: true
+      when: inventory_hostname == backup_repository_host
+    - name: Compute the source archive SHA-256
+      ansible.builtin.stat:
+        path: '/var/lib/pg-ha-exports/{{ export_id }}.tar'
+        checksum_algorithm: sha256
+      register: export_source
+      when: inventory_hostname == backup_repository_host
+    - name: Compute the controller archive SHA-256 independently
+      ansible.builtin.stat:
+        path: '{{ export_controller_dir }}/{{ export_id }}.tar'
+        checksum_algorithm: sha256
+      register: export_destination
+      delegate_to: localhost
+      become: false
+      when: inventory_hostname == backup_repository_host
+    - name: Require identical source and exported archive digests
+      ansible.builtin.assert:
+        that: export_source.stat.checksum == export_destination.stat.checksum
+      when: inventory_hostname == backup_repository_host
+    - name: Prove normal archiving resumed after export
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', check]
+      become_user: postgres
+      changed_when: false
+      when: inventory_hostname == backup_repository_host
+    - name: Record encrypted export evidence
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'path': export_controller_dir ~ '/' ~ export_id ~ '.tar', 'sha256': export_source.stat.checksum, 'bytes': export_source.stat.size, 'source': backup_repository_host, 'archiving_resumed': true, 'offsite': false} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/export-evidence.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      when: inventory_hostname == backup_repository_host

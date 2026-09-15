@@ -1,0 +1,14 @@
+---
+- name: Inspect only isolated reconciliation test service logs
+  hosts: "{{ qa_host | mandatory }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read test Patroni and etcd diagnostics
+      ansible.builtin.command:
+        argv: [journalctl, '-u', pg-ha-reconcile-qa-patroni.service, '-u', pg-ha-reconcile-qa-etcd.service, '-n', '70', '--no-pager']
+      changed_when: false
+      register: qa_log
+    - name: Report isolated test diagnostics
+      ansible.builtin.debug:
+        var: qa_log.stdout_lines

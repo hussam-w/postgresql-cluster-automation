@@ -1,0 +1,17 @@
+[Unit]
+Description=Primary-only logical PostgreSQL backup
+RequiresMountsFor={{ backup_target_path }} {{ logical_backup_socket }}
+After={{ 'pg-ha-patroni' if postgresql_deployment.mode == 'cluster' else 'pg-standalone-' ~ logical_backup_name }}.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+UMask=0077
+ExecStart=/usr/bin/python3 /usr/local/bin/pg-ha-logical-backup /etc/pg-ha-logical-backup/{{ logical_backup_name }}.json
+TimeoutStartSec=12h
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths={{ backup_target_path }}

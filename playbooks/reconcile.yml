@@ -1,0 +1,99 @@
+---
+- name: Inspect before admitting any change
+  ansible.builtin.import_playbook: inspect.yml
+
+- name: Validate the complete plan across all hosts before the first write
+  hosts: postgres_cluster
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require a supported explicit change intent and complete observation
+      ansible.builtin.assert:
+        that:
+          - reconcile_confirmation | default('') == 'APPLY RELOAD SETTINGS'
+          - not reconciliation_blocked
+          - reconciliation_discovered
+          - ansible_play_hosts | sort == groups['postgres_cluster'] | sort
+        fail_msg: 'No changes admitted: inspect coverage, identity and ownership; review the reload scope.'
+
+    - name: Reject all unsupported changes before changing any instance
+      ansible.builtin.assert:
+        that:
+          - item.report.plan.blockers | length == 0
+          - item.report.plan.changes | length == 0 or item.item.allow_reload | default(false) | bool
+          - item.item.parameters | default({}) | length == 0 or item.item.expected_system_id | default('') == item.report.identity.system_id
+          - item.report.plan.changes | length == 0 or item.item.expected_plan_sha256 | default('') == item.report.plan_sha256
+        fail_msg: 'The proposed change is blocked, unapproved or stale. Run site.yml in plan mode and review its report.'
+      loop: '{{ runtime_scan.results | default([]) }}'
+      loop_control:
+        label: '{{ item.item.socket_dir }}:{{ item.item.port | default(5432) }}'
+
+    - name: Require exactly one writer for each Patroni cluster system identifier
+      ansible.builtin.assert:
+        that: dcs_writers | length == dcs_writers | unique | length
+        fail_msg: 'Declare Patroni desired parameters on exactly one member; DCS changes are cluster-wide.'
+      vars:
+        dcs_writers: "{{ groups['postgres_cluster'] | map('extract', hostvars, 'runtime_scan') | map(attribute='results') | flatten | selectattr('report.manager', 'equalto', 'patroni') | selectattr('report.plan.changes') | map(attribute='report.identity.system_id') | list }}"
+      run_once: true
+
+    - name: Validate parameter compatibility on all observed replicas before DCS writes
+      ansible.builtin.assert:
+        that:
+          - groups['postgres_cluster'] | map('extract', hostvars, 'runtime_scan') | list | reconciliation_errors | length == 0
+      run_once: true
+
+    - name: Require complete Patroni membership for cluster-wide parameter changes
+      ansible.builtin.assert:
+        that: item.report.patroni_members | sort == groups['postgres_cluster'] | sort
+        fail_msg: 'DCS settings affect every member; supply the full cluster inventory with matching member names.'
+      loop: '{{ runtime_scan.results | default([]) }}'
+      when: item.report.manager == 'patroni' and item.report.plan.changes | length > 0
+      loop_control:
+        label: '{{ item.item.socket_dir }}'
+
+- name: Apply only admitted reloadable parameters one host at a time
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse dependent work after any failed host
+      ansible.builtin.assert:
+        that: ansible_play_hosts | sort == groups['postgres_cluster'] | sort
+      run_once: true
+
+    - name: Recheck identity and configuration then apply only necessary settings
+      postgres_reconcile:
+        socket_dir: '{{ item.socket_dir }}'
+        port: '{{ item.port | default(5432) }}'
+        owner: '{{ item.owner | default("postgres") }}'
+        database: '{{ item.database | default("postgres") }}'
+        manager: '{{ item.manager | default("observe") }}'
+        patroni_config: '{{ item.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}'
+        parameters: '{{ item.parameters | default({}) }}'
+        expected_system_id: '{{ item.expected_system_id | default("") }}'
+        expected_plan_sha256: '{{ item.expected_plan_sha256 | default("") }}'
+        allow_reload: '{{ item.allow_reload | default(false) }}'
+        backup_root: '{{ reconcile_backup_root | default("/var/lib/pg-ha-reconcile") }}'
+        operation: apply
+      loop: '{{ reconcile_instances | default([]) }}'
+      loop_control:
+        label: '{{ item.socket_dir }}:{{ item.port | default(5432) }}'
+
+- name: Reinspect every host after reconciliation
+  ansible.builtin.import_playbook: inspect.yml
+
+- name: Require full post-change SQL convergence
+  hosts: postgres_cluster
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse success if any instance failed observation or convergence
+      ansible.builtin.assert:
+        that:
+          - not reconciliation_blocked
+          - groups['postgres_cluster'] | map('extract', hostvars, 'runtime_scan') | list | reconciliation_errors(true) | length == 0
+        fail_msg: 'Post-change verification failed. Stop maintenance and inspect protected backups; do not restart or force failover.'

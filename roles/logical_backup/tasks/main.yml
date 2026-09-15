@@ -1,0 +1,127 @@
+---
+- name: Resolve component backup identity and endpoint
+  ansible.builtin.set_fact:
+    logical_backup_name: "{{ cluster.name if postgresql_deployment.mode == 'cluster' else (standalone | default({})).get('name', 'main') }}"
+    logical_backup_data: '{{ model_extensions.report.identity.data_dir }}'
+    logical_backup_socket: '{{ model_instance.socket_dir }}'
+    logical_backup_port: '{{ model_instance.port }}'
+- name: Require a dedicated protected backup target outside database data
+  ansible.builtin.assert:
+    that:
+      - model_instance.owner == 'postgres'
+      - logical_backup_name is match('^[a-zA-Z0-9_.-]+$')
+      - backup_target_path is defined
+      - backup_target_path is match('^/(srv|data|mnt|var/backups|home/[a-zA-Z0-9_-]+)/[a-zA-Z0-9_/-]+$')
+      - "'..' not in backup_target_path.split('/')"
+      - backup_target_path != logical_backup_data
+      - not backup_target_path.startswith(logical_backup_data.rstrip('/') ~ '/')
+      - not logical_backup_data.startswith(backup_target_path.rstrip('/') ~ '/')
+      - backup_schedule | default('*-*-* 02:15:00 UTC') is string
+      - "'\n' not in (backup_schedule | default('')) and '\r' not in (backup_schedule | default(''))"
+- name: Resolve existing backup path without following unreviewed aliases
+  ansible.builtin.command:
+    argv: [readlink, '-m', '{{ backup_target_path }}']
+  register: logical_backup_realpath
+  changed_when: false
+- name: Require canonical backup path
+  ansible.builtin.assert:
+    that: logical_backup_realpath.stdout == backup_target_path
+- name: Reject overlap with external WAL and consensus storage
+  ansible.builtin.assert:
+    that:
+      - backup_target_path != item
+      - not backup_target_path.startswith(item.rstrip('/') ~ '/')
+      - not item.startswith(backup_target_path.rstrip('/') ~ '/')
+  loop: "{{ [(cluster | default({})).get('wal_dir'), (cluster | default({})).get('etcd_data_dir'), (standalone | default({})).get('wal_dir')] | reject('equalto', none) | list }}"
+- name: Inspect existing target permissions
+  ansible.builtin.stat:
+    path: '{{ backup_target_path }}'
+  register: logical_backup_target
+- name: Preserve unrelated directories instead of changing their ownership
+  ansible.builtin.assert:
+    that: not logical_backup_target.stat.exists or (logical_backup_target.stat.isdir and logical_backup_target.stat.pw_name == 'postgres' and logical_backup_target.stat.mode == '0700')
+    fail_msg: 'Existing backup target requires a dedicated postgres-owned 0700 directory; existing ownership and permissions are preserved.'
+- name: Validate the schedule before changing files
+  ansible.builtin.command:
+    argv: [systemd-analyze, calendar, '{{ backup_schedule | default("*-*-* 02:15:00 UTC") }}']
+  changed_when: false
+- name: Inspect backup ownership before replacing configuration or units
+  ansible.builtin.stat:
+    path: '{{ item }}'
+  loop:
+    - '/etc/pg-ha-logical-backup/{{ logical_backup_name }}.json'
+    - '/etc/systemd/system/pg-ha-logical-backup-{{ logical_backup_name }}.service'
+    - '/etc/systemd/system/pg-ha-logical-backup-{{ logical_backup_name }}.timer'
+  register: logical_backup_existing
+- name: Preserve unowned backup units and unsafe configuration
+  ansible.builtin.assert:
+    that:
+      - not logical_backup_existing.results[0].stat.exists or (logical_backup_existing.results[0].stat.isreg and not logical_backup_existing.results[0].stat.islnk and logical_backup_existing.results[0].stat.uid == 0 and logical_backup_existing.results[0].stat.mode == '0640')
+      - logical_backup_existing.results[0].stat.exists or not (logical_backup_existing.results[1].stat.exists or logical_backup_existing.results[2].stat.exists)
+    fail_msg: 'Existing backup files do not have the expected protected ownership; preserve them and review manually.'
+- name: Read existing backup identity
+  ansible.builtin.assert:
+    that: not item.stat.exists or (item.stat.isreg and not item.stat.islnk and item.stat.uid == 0 and not item.stat.wgrp and not item.stat.woth)
+    fail_msg: 'Backup files must be regular, root-owned and protected before replacement.'
+  loop: '{{ logical_backup_existing.results }}'
+- name: Read existing backup configuration identity
+  ansible.builtin.slurp:
+    src: '/etc/pg-ha-logical-backup/{{ logical_backup_name }}.json'
+  register: logical_backup_previous
+  when: logical_backup_existing.results[0].stat.exists
+- name: Refuse reuse of backup configuration for another cluster
+  ansible.builtin.assert:
+    that:
+      - (logical_backup_previous.content | b64decode | from_json).system_id == model_extensions.report.identity.system_id
+  when: logical_backup_existing.results[0].stat.exists
+- name: Create only the missing backup target directory
+  ansible.builtin.file:
+    path: '{{ backup_target_path }}'
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+  when: not logical_backup_target.stat.exists
+- name: Prepare the backup configuration directory
+  ansible.builtin.file:
+    path: /etc/pg-ha-logical-backup
+    state: directory
+    owner: root
+    group: postgres
+    mode: '0750'
+- name: Install the logical backup runner
+  ansible.builtin.copy:
+    src: logical_backup.py
+    dest: /usr/local/bin/pg-ha-logical-backup
+    owner: root
+    group: root
+    mode: '0755'
+    backup: true
+- name: Store the nonsecret backup configuration
+  ansible.builtin.copy:
+    content: "{{ {'target': backup_target_path, 'socket': logical_backup_socket, 'port': logical_backup_port, 'major': postgresql_deployment.major, 'system_id': model_extensions.report.identity.system_id} | to_nice_json }}"
+    dest: '/etc/pg-ha-logical-backup/{{ logical_backup_name }}.json'
+    owner: root
+    group: postgres
+    mode: '0640'
+    backup: true
+- name: Install backup units
+  ansible.builtin.template:
+    src: '{{ item }}.j2'
+    dest: '/etc/systemd/system/pg-ha-logical-backup-{{ logical_backup_name }}.{{ item }}'
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  loop: [service, timer]
+  register: logical_backup_units
+- name: Validate backup units before activation
+  ansible.builtin.command:
+    argv: [systemd-analyze, verify, '/etc/systemd/system/pg-ha-logical-backup-{{ logical_backup_name }}.service', '/etc/systemd/system/pg-ha-logical-backup-{{ logical_backup_name }}.timer']
+  changed_when: false
+- name: Enable the selected backup timer without restarting PostgreSQL
+  ansible.builtin.systemd_service:
+    name: 'pg-ha-logical-backup-{{ logical_backup_name }}.timer'
+    daemon_reload: '{{ logical_backup_units.changed }}'
+    enabled: true
+    state: "{{ 'restarted' if logical_backup_units.changed else 'started' }}"

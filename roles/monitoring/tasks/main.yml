@@ -1,0 +1,68 @@
+---
+- name: Create protected monitoring status directory
+  ansible.builtin.file:
+    path: /var/lib/pg-ha-monitor
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0750'
+- name: Install functional monitoring implementation
+  ansible.builtin.copy:
+    backup: true
+    src: health_monitor.py
+    dest: /usr/local/libexec/pg-ha/health-monitor
+    mode: '0755'
+- name: Install protected monitoring connection policy
+  ansible.builtin.copy:
+    backup: true
+    content: "{{ {'sync_count': (cluster.replication.synchronous_node_count if cluster.replication.mode == 'strict_sync' else 0), 'pg_port': pg_port, 'etcd_url': 'https://' ~ node.dns_name ~ ':' ~ etcd_client_port, 'etcdctl': etcd_binary_dir ~ '/etcdctl', 'mounts': [cluster.postgres_mount, cluster.etcd_mount, backup_repository_path | dirname], 'patroni_url': 'https://' ~ node.dns_name ~ ':' ~ patroni_port, 'members': groups['postgres_cluster'], 'write_port': write_port, 'read_port': read_port, 'vip_dns': cluster.vip_dns_name, 'vip': cluster.vip, 'database': application_databases[0].name, 'user': application_databases[0].owner, 'password': (vault_app_users | selectattr('name', 'equalto', application_databases[0].owner) | first).password, 'repository_host': inventory_hostname == backup_repository_host, 'stanza': cluster.name} | to_nice_json }}"
+    dest: /etc/pg-ha/monitor.json
+    owner: postgres
+    group: postgres
+    mode: '0600'
+  no_log: true
+  diff: false
+- name: Install functional monitor service
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      [Unit]
+      Description=PostgreSQL HA functional health and recovery coverage
+      After=pg-ha-patroni.service
+      [Service]
+      Type=oneshot
+      User=postgres
+      Group=postgres
+      ExecStart=/usr/local/libexec/pg-ha/health-monitor
+      TimeoutStartSec=90
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ProtectHome=true
+      ReadWritePaths=/var/lib/pg-ha-monitor /var/log/pgbackrest /var/lib/pgbackrest
+    dest: /etc/systemd/system/pg-ha-monitor.service
+    mode: '0644'
+- name: Schedule functional monitoring
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      [Unit]
+      Description=Run PostgreSQL HA monitoring every minute
+      [Timer]
+      OnBootSec=90
+      OnUnitActiveSec=60
+      RandomizedDelaySec=5
+      [Install]
+      WantedBy=timers.target
+    dest: /etc/systemd/system/pg-ha-monitor.timer
+    mode: '0644'
+- name: Enable monitoring timer
+  ansible.builtin.systemd_service:
+    name: pg-ha-monitor.timer
+    enabled: true
+    daemon_reload: true
+    state: started
+- name: Run initial functional monitor
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/pg-ha/health-monitor]
+  become_user: postgres
+  changed_when: false

@@ -1,0 +1,59 @@
+---
+- name: Admit only explicitly selected legacy provisioning or maintenance operations
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  strategy: linear
+  tasks:
+    - name: Refuse implicit provisioning maintenance and historical migrations
+      ansible.builtin.assert:
+        that:
+          - guarded_operation in (maintenance_approved_operations | default([]))
+          - maintenance_intent | default('') in ['fresh', 'maintenance']
+          - ansible_play_hosts_all | sort == groups['postgres_cluster'] | sort
+          - ansible_play_hosts | sort == groups['postgres_cluster'] | sort
+        fail_msg: 'This is an opt-in maintenance operation, not a safe reconcile entry point. Use site.yml for routine discovery. Review docs/safe-reexecution.md before approving this exact operation.'
+      tags: [always]
+
+    - name: Observe every host before the first admitted legacy mutation
+      infrastructure_discovery:
+        management_ip: '{{ ansible_host }}'
+        peers: "{{ groups['postgres_cluster'] | map('extract', hostvars, 'ansible_host') | list }}"
+        ssh_port: '{{ ansible_port | default(22) }}'
+        admin_user: '{{ ansible_user }}'
+        additional_data_roots: '{{ discovery_additional_data_roots | default([]) }}'
+      register: maintenance_observation
+      when: not (maintenance_scope_admitted | default(false))
+      no_log: true
+      tags: [always]
+
+    - name: Refuse incomplete observation and preexisting data in fresh mode
+      ansible.builtin.assert:
+        that:
+          - maintenance_observation.report.coverage_complete
+          - maintenance_intent != 'fresh' or maintenance_observation.report.data_state_markers | length == 0
+          - maintenance_intent != 'fresh' or maintenance_observation.report.component_units | selectattr('Id', 'search', '\.(service|socket|timer)$') | selectattr('ActiveState', 'equalto', 'active') | list | length == 0
+          - maintenance_intent != 'fresh' or maintenance_observation.report.configuration_directory_entries | length == 0
+        fail_msg: 'Existing data, active services or incomplete coverage prevents fresh provisioning. Preserve the environment and use routine inspection/reconciliation.'
+      when: not (maintenance_scope_admitted | default(false))
+      tags: [always]
+
+    - name: Admit this inventory for this process only
+      ansible.builtin.set_fact:
+        maintenance_scope_admitted: true
+      tags: [always]
+
+    - name: Detect completed ownership before any bootstrap helper can modify configuration
+      ansible.builtin.stat:
+        path: /var/lib/pg-ha/identity.json
+        get_checksum: false
+      register: completed_ownership
+      tags: [always]
+
+    - name: Never replay bootstrap against a completed cluster
+      ansible.builtin.assert:
+        that: not completed_ownership.stat.exists
+        fail_msg: 'This cluster is already provisioned. Use site.yml plan/reconcile or verify.yml; bootstrap helpers cannot adopt it.'
+      when: guarded_operation in ['deploy', 'bootstrap', 'continue-bootstrap', 'provision-cluster']
+      tags: [always]

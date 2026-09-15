@@ -1,0 +1,194 @@
+---
+- name: Validate opt-in mounted storage before HA changes
+  ansible.builtin.include_role:
+    name: storage_guard
+
+- name: Install pinned PostgreSQL packaging without automatic service starts
+  ansible.builtin.apt:
+    name: "postgresql-common={{ cluster.packages['postgresql-common'] }}"
+    state: present
+    policy_rc_d: 101
+    update_cache: true
+    lock_timeout: 600
+  register: pg_common_install
+  retries: 20
+  delay: 15
+  until: pg_common_install is succeeded
+
+- name: Prevent distribution packaging from creating a standalone PostgreSQL cluster
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql-common/createcluster.conf
+    regexp: '^\s*#?\s*create_main_cluster\s*='
+    line: 'create_main_cluster = false'
+    backup: true
+
+- name: Install explicitly pinned service packages from provisioned signed repositories
+  ansible.builtin.apt:
+    name: "{{ cluster.packages | dict2items | map(attribute='key') | zip(cluster.packages | dict2items | map(attribute='value')) | map('join', '=') | list }}"
+    state: present
+    policy_rc_d: 101
+    allow_downgrade: false
+    lock_timeout: 600
+  register: cluster_package_install
+  retries: 20
+  delay: 15
+  until: cluster_package_install is succeeded
+
+- name: Install the checksum-pinned upstream etcd binaries
+  ansible.builtin.include_tasks: etcd-artifact.yml
+
+- name: Install explicitly selected version-qualified extension packages before initial startup
+  ansible.builtin.include_role:
+    name: packages_safe
+  vars:
+    component_packages: '{{ hostvars.localhost.deployment_model.extensions.packages }}'
+    component_package_versions: '{{ cluster.packages | combine(postgresql_package_versions | default({})) }}'
+  when: postgresql_deployment is defined
+
+- name: Verify selected PostgreSQL binaries and initialization capabilities
+  postgres_binary_info:
+    major: '{{ postgresql_major }}'
+    data_dir: '{{ cluster.data_dir }}'
+
+- name: Prepare the newly admitted WAL directory without changing its parent mount
+  ansible.builtin.file:
+    path: '{{ cluster.wal_dir }}'
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+  when: cluster.wal_dir is defined and deployment_mode == 'bootstrap'
+
+- name: Discover installed vendor startup authorities
+  ansible.builtin.service_facts:
+
+- name: Disable installed vendor startup authorities
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    masked: true
+    state: stopped
+  loop: "{{ ['postgresql.service', 'patroni.service', 'etcd.service', 'pgbouncer.service'] + (['haproxy.service', 'keepalived.service'] if haproxy_enabled else []) }}"
+  when: item in ansible_facts.services
+
+- name: Mask standalone PostgreSQL instance activation
+  ansible.builtin.systemd_service:
+    name: postgresql@.service
+    masked: true
+
+- name: Confirm packages did not create a database cluster
+  ansible.builtin.find:
+    paths: /var/lib/postgresql
+    patterns: PG_VERSION
+    recurse: true
+  register: vendor_clusters
+
+- name: Reject unexpected package-created database data
+  ansible.builtin.assert:
+    that: vendor_clusters.matched == 0
+    fail_msg: 'Unexpected PostgreSQL data found after packaging; retain it and investigate. Nothing will be removed.'
+
+- name: Create pooler service account independently of distribution packaging
+  ansible.builtin.user:
+    name: pgbouncer
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Create private configuration directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "{{ item.mode | default('0750') }}"
+  loop:
+    - {path: /etc/pg-ha, owner: root, mode: '0755'}
+    - {path: /etc/pg-ha/postgres, owner: postgres}
+    - {path: /etc/pg-ha/patroni, owner: postgres}
+    - {path: /etc/pg-ha/dcs, owner: postgres}
+    - {path: /etc/pg-ha/etcd, owner: etcd}
+    - {path: /etc/pg-ha/pgbouncer, owner: pgbouncer}
+    - {path: /etc/pg-ha/haproxy, owner: root}
+    - {path: /var/lib/pg-ha, owner: root}
+    - {path: /usr/local/libexec/pg-ha, owner: root, mode: '0755'}
+  when: item.path != '/etc/pg-ha/haproxy' or (haproxy_enabled and inventory_hostname in groups['routers'])
+
+- name: Allow service accounts to traverse the nonsecret configuration parent
+  ansible.builtin.file:
+    path: /etc/pg-ha
+    mode: '0755'
+
+- name: Create dedicated persistent data directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: '0700'
+  loop:
+    - {path: "{{ cluster.data_dir }}", owner: postgres}
+    - {path: "{{ cluster.etcd_data_dir }}", owner: etcd}
+  when: item.owner != 'etcd' or inventory_hostname in groups['etcd_cluster']
+
+- name: Install service TLS material with protected ownership
+  ansible.builtin.include_tasks: tls.yml
+  loop:
+    - {service: postgres, owner: postgres}
+    - {service: patroni, owner: postgres}
+    - {service: dcs, owner: postgres}
+    - {service: pgbouncer, owner: pgbouncer}
+    - {service: etcd, owner: etcd}
+    - {service: haproxy, owner: root}
+  loop_control:
+    loop_var: tls_service
+  when: (tls_service.service != 'etcd' or inventory_hostname in groups['etcd_cluster']) and (tls_service.service != 'haproxy' or (haproxy_enabled and inventory_hostname in groups['routers']))
+
+- name: Verify key pairing, certificate lifetime and separate database/control-plane trust
+  cluster_tls_check:
+    core: "{{ inventory_hostname in groups['etcd_cluster'] }}"
+    router: "{{ haproxy_enabled and inventory_hostname in groups['routers'] }}"
+
+- name: Assemble HAProxy mTLS certificate bundle
+  ansible.builtin.copy:
+    backup: true
+    content: "{{ lookup('file', tls_sources.haproxy.cert) ~ '\n' ~ lookup('file', tls_sources.haproxy.key) ~ '\n' }}"
+    dest: /etc/pg-ha/haproxy/client.pem
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  diff: false
+  when: inventory_hostname in groups['routers']
+
+- name: Check installed executable releases before rendering service configuration
+  ansible.builtin.command:
+    argv: "{{ item.argv }}"
+  changed_when: false
+  register: version_checks
+  failed_when: version_checks.rc != 0 or item.expected not in (version_checks.stdout ~ version_checks.stderr)
+  loop:
+    - {argv: ['{{ binary_dir }}/postgres', '--version'], expected: 'PostgreSQL) {{ postgresql_major }}.'}
+    - {argv: ['/usr/bin/patroni', '--version'], expected: "{{ cluster.expected_versions.patroni }}"}
+    - {argv: ['{{ etcd_binary_dir }}/etcd', '--version'], expected: "{{ cluster.expected_versions.etcd }}"}
+    - {argv: ['/usr/sbin/haproxy', '-v'], expected: "{{ cluster.expected_versions.haproxy | default('disabled') }}"}
+    - {argv: ['/usr/sbin/pgbouncer', '--version'], expected: "{{ cluster.expected_versions.pgbouncer }}"}
+    - {argv: ['/usr/sbin/keepalived', '--version'], expected: "{{ cluster.expected_versions.keepalived | default('disabled') }}"}
+  when: haproxy_enabled or item.argv[0] not in ['/usr/sbin/haproxy', '/usr/sbin/keepalived']
+  # Native version queries have no equivalent fact/module across these services.
+
+- name: Confirm postgres can access the provisioned watchdog without opening it
+  ansible.builtin.command:
+    argv: [/usr/bin/test, '-w', "{{ cluster.watchdog_device }}"]
+  become_user: postgres
+  changed_when: false
+  # test uses access(2); opening the watchdog here could arm it and reboot the host.
+
+- name: Install configuration validator
+  ansible.builtin.copy:
+    backup: true
+    src: validate_config.py
+    dest: /usr/local/libexec/pg-ha/validate-config
+    owner: root
+    group: root
+    mode: '0755'

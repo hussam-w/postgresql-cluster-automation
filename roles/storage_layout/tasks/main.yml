@@ -1,0 +1,44 @@
+---
+- name: Resolve the target account home or explicit environment root
+  storage_layout_info:
+    layout: '{{ storage_layout }}'
+  register: storage_resolution
+  when: storage_layout is defined
+- name: Retain the resolved paths for this run
+  ansible.builtin.set_fact:
+    storage_paths: '{{ storage_resolution.paths }}'
+  when: storage_layout is defined
+- name: Refuse hidden home trees for the hardened HA services
+  ansible.builtin.assert:
+    that:
+    - not storage_paths.root.startswith('/home/')
+    - not storage_paths.root.startswith('/root/')
+    - groups['postgres_cluster'] | map('extract', hostvars, 'storage_paths') | map(attribute='root') | unique | length == 1
+    fail_msg: HA requires a common service-visible absolute path on all nodes. Use /srv and bind/mount site-specific storage there; ProtectHome
+      remains enabled.
+  when: storage_layout is defined and (postgresql_deployment | default({})).get('mode', 'cluster') == 'cluster'
+- name: Apply resolved standalone paths to desired policy only
+  ansible.builtin.set_fact:
+    standalone: '{{ standalone | default({}) | combine({''data_dir'': storage_paths.data_dir, ''wal_dir'': storage_paths.wal_dir, ''storage_mount'':
+      storage_paths.data_mount}) }}'
+  when: storage_layout is defined and (postgresql_deployment | default({})).get('mode') == 'standalone'
+- name: Apply resolved HA paths to desired policy only
+  ansible.builtin.set_fact:
+    cluster: '{{ cluster | combine({''data_dir'': storage_paths.data_dir, ''postgres_mount'': storage_paths.data_mount, ''wal_dir'': storage_paths.wal_dir})
+      }}'
+    backup_repository_path: '{{ storage_paths.backup_dir }}'
+  when: storage_layout is defined and (postgresql_deployment | default({})).get('mode', 'cluster') == 'cluster'
+- name: Report the storage layout and mount observations
+  ansible.builtin.debug:
+    msg:
+      paths: '{{ storage_paths }}'
+      mounted: '{{ storage_resolution.mounted }}'
+      action: Desired paths only. No directory, mount, filesystem or data migration performed.
+  when: storage_layout is defined
+- name: Refuse higher-precedence overrides that conflict with the resolved layout
+  ansible.builtin.assert:
+    that:
+      - "(postgresql_deployment | default({})).get('mode') != 'standalone' or (standalone.data_dir == storage_paths.data_dir and standalone.wal_dir == storage_paths.wal_dir and standalone.storage_mount == storage_paths.data_mount)"
+      - "(postgresql_deployment | default({})).get('mode') == 'standalone' or (cluster.data_dir == storage_paths.data_dir and cluster.wal_dir == storage_paths.wal_dir and cluster.postgres_mount == storage_paths.data_mount and backup_repository_path == storage_paths.backup_dir)"
+    fail_msg: 'Explicit higher-precedence path overrides conflict with storage_layout. Use one path source of truth.'
+  when: storage_layout is defined

@@ -1,0 +1,12 @@
+network:
+  version: 2
+  ethernets:
+    {{ node.interface }}:
+      dhcp4: true
+      addresses: [{{ node.address }}/{{ platform_service_prefix }}]
+      routes:
+{% for host in groups['postgres_cluster'] if host != inventory_hostname %}
+        - to: {{ hostvars[host].node.address }}/32
+          scope: link
+          from: {{ node.address }}
+{% endfor %}

@@ -1,0 +1,25 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: ip-migration-closeout
+
+- name: Verify final certificates and services independently
+  ansible.builtin.import_playbook: final-acceptance.yml
+- name: Verify backup transport after certificate migration
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Validate backup certificate actual IP identity
+      ansible.builtin.command:
+        argv: [openssl, verify, -CAfile, /etc/pgbackrest/ca.pem, -verify_ip, '{{ node.address }}', /etc/pgbackrest/cert.pem]
+      changed_when: false
+    - name: Confirm WAL archiving and backup transport with final certificates
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', check]
+      become_user: postgres
+      changed_when: false
+      when: inventory_hostname == backup_repository_host

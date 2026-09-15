@@ -1,0 +1,78 @@
+---
+- name: Discover existing infrastructure and plan without changing target configuration
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  strategy: linear
+  tasks:
+    - name: Require the full selected inventory before discovery
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | sort == groups['postgres_cluster'] | sort
+          - ansible_play_hosts | sort == groups['postgres_cluster'] | sort
+        fail_msg: 'Use a separate inventory for a different scope; partial cluster runs are refused.'
+      run_once: true
+
+    - name: Inspect OS packages storage addresses services and database markers
+      infrastructure_discovery:
+        management_ip: '{{ ansible_host }}'
+        peers: "{{ groups['postgres_cluster'] | map('extract', hostvars, 'ansible_host') | list }}"
+        ssh_port: '{{ ansible_port | default(22) }}'
+        admin_user: '{{ ansible_user }}'
+        additional_data_roots: '{{ discovery_additional_data_roots | default([]) }}'
+        scan_roots: '{{ discovery_scan_roots | default([]) }}'
+      register: environment_scan
+      no_log: true
+
+    - name: Resolve running PostgreSQL instances and preserve offline instances
+      postgres_instances_info:
+        markers: '{{ environment_scan.report.data_state_markers }}'
+        instances: '{{ reconcile_instances | default([]) }}'
+      register: detected_instances
+
+    - name: Inspect catalogs configuration identities and proposed parameter changes
+      postgres_reconcile:
+        socket_dir: '{{ item.socket_dir }}'
+        port: '{{ item.port | default(5432) }}'
+        owner: '{{ item.owner | default("postgres") }}'
+        database: '{{ item.database | default("postgres") }}'
+        manager: '{{ item.manager | default("observe") }}'
+        patroni_config: '{{ item.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}'
+        parameters: '{{ item.parameters | default({}) }}'
+        operation: plan
+      loop: '{{ detected_instances.instances }}'
+      loop_control:
+        label: '{{ item.socket_dir }}:{{ item.port | default(5432) }}'
+      register: runtime_scan
+      ignore_errors: true
+      no_log: true
+
+    - name: Report detections changes skipped resources and intervention conditions
+      ansible.builtin.debug:
+        msg:
+          host: '{{ inventory_hostname }}'
+          os: '{{ environment_scan.report.os }}'
+          packages: '{{ environment_scan.report.component_packages }}'
+          services: '{{ environment_scan.report.component_units }}'
+          existing_state: '{{ environment_scan.report.existing_state_detected }}'
+          infrastructure_coverage_issues: '{{ environment_scan.report.coverage_issues }}'
+          offline_clusters_preserved: '{{ detected_instances.offline_data_directories }}'
+          instance_coverage_gaps: '{{ detected_instances.coverage_gaps }}'
+          runtime: '{{ runtime_scan.results | default([]) | reconciliation_summary }}'
+          sql_observation_failed: '{{ runtime_scan.failed | default(false) }}'
+          skipped: 'Packages, storage, network, services, roles, databases, extensions, HBA and certificates are observation-only.'
+
+    - name: Show complete metadata when verbose reporting is requested
+      ansible.builtin.debug:
+        var: runtime_scan.results
+        verbosity: 1
+
+    - name: Retain the complete plan in memory for the all-host apply gate
+      ansible.builtin.set_fact:
+        reconciliation_discovered: true
+        reconciliation_blocked: >-
+          {{ not environment_scan.report.coverage_complete or
+             detected_instances.coverage_gaps | length > 0 or
+             runtime_scan.failed | default(false) or
+             runtime_scan.results | default([]) | selectattr('failed', 'defined') | selectattr('failed') | list | length > 0 }}

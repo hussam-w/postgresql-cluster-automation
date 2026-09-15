@@ -1,0 +1,39 @@
+global_defs {
+    router_id {{ inventory_hostname }}
+    enable_script_security
+    script_user root
+}
+
+vrrp_script usable_routing {
+    script "/usr/local/libexec/pg-ha/check-vip"
+    interval 2
+    timeout 2
+    fall 2
+    rise 2
+    weight 0
+    init_fail
+}
+
+vrrp_instance PG_HA {
+    state BACKUP
+    interface {{ node.interface }}
+    virtual_router_id {{ cluster.vrid }}
+    priority {{ node.priority }}
+    advert_int 1
+    nopreempt
+{% if groups['routers'] | length > 1 %}
+    unicast_src_ip {{ node.address }}
+    check_unicast_src
+    unicast_peer {
+{% for host in groups['routers'] if host != inventory_hostname %}
+        {{ hostvars[host].node.address }}
+{% endfor %}
+    }
+{% endif %}
+    virtual_ipaddress {
+        {{ cluster.vip }}/{{ cluster.vip_prefix }} dev {{ node.interface }}
+    }
+    track_script {
+        usable_routing
+    }
+}

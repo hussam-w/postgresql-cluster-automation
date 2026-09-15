@@ -1,0 +1,9 @@
+---
+- name: Resolve opt-in storage paths without changing files or mounts
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+  - role: storage_layout
+    when: storage_layout is defined

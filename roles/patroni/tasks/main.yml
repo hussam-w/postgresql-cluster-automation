@@ -1,0 +1,71 @@
+---
+- name: Render and validate Patroni configuration before service activation
+  ansible.builtin.template:
+    src: patroni.yml.j2
+    dest: /etc/pg-ha/patroni/patroni.yml
+    owner: postgres
+    group: postgres
+    mode: '0600'
+    backup: true
+    validate: "/usr/bin/patroni --validate-config {{ '--ignore-listen-port' if deployment_mode == 'resume' else '' }} %s"
+  no_log: true
+  diff: false
+
+- name: Install Patroni unit
+  ansible.builtin.template:
+    backup: true
+    src: pg-ha-patroni.service.j2
+    dest: /etc/systemd/system/pg-ha-patroni.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Validate the Patroni systemd unit before activation
+  ansible.builtin.command:
+    argv: [/usr/bin/systemd-analyze, verify, /etc/systemd/system/pg-ha-patroni.service]
+  changed_when: false
+
+- name: Activate only the explicitly selected initial primary
+  ansible.builtin.systemd_service:
+    name: pg-ha-patroni
+    daemon_reload: true
+    enabled: true
+    state: started
+  when: inventory_hostname == cluster.bootstrap_host
+
+- name: Wait for the initial primary to hold the Patroni leader lock
+  ansible.builtin.uri:
+    url: "https://{{ hostvars[cluster.bootstrap_host].node.dns_name }}:{{ patroni_port }}/primary"
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    validate_certs: true
+    use_proxy: false
+    status_code: 200
+  register: primary_ready
+  retries: 60
+  delay: 3
+  until: primary_ready.status | default(0) == 200
+
+- name: Provision empty replicas through Patroni after the primary is established
+  ansible.builtin.systemd_service:
+    name: pg-ha-patroni
+    daemon_reload: true
+    enabled: true
+    state: started
+  when: inventory_hostname != cluster.bootstrap_host
+
+- name: Wait for actual replica role and bounded replay lag
+  ansible.builtin.uri:
+    url: "https://{{ node.dns_name }}:{{ patroni_port }}/replica?lag={{ cluster.replication.read_lag_bytes }}"
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    validate_certs: true
+    use_proxy: false
+    status_code: 200
+  register: replica_ready
+  retries: 120
+  delay: 5
+  until: replica_ready.status | default(0) == 200
+  when: inventory_hostname != cluster.bootstrap_host

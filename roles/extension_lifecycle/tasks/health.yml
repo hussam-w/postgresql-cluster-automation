@@ -1,0 +1,30 @@
+---
+- name: Check every Patroni member over verified mutual TLS
+  ansible.builtin.uri:
+    url: 'https://{{ hostvars[item].node.dns_name }}:{{ cluster.ports.patroni | default(8008) }}/patroni'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+    timeout: 10
+    return_content: true
+  loop: '{{ groups.postgres_cluster }}'
+  register: extension_members
+  retries: 15
+  delay: 2
+  until: extension_members is succeeded
+- name: Observe cluster-wide lag and consensus-backed leadership
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:{{ cluster.ports.patroni | default(8008) }}/cluster'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+    timeout: 10
+  register: extension_cluster_health
+- name: Require healthy matching members and bounded replication lag
+  ansible.builtin.assert:
+    that: health_errors | length == 0
+    fail_msg: '{{ health_errors }}'
+  vars:
+    health_errors: "{{ extension_members.results | extension_health_errors(extension_cluster_health.json.members, groups.postgres_cluster, postgresql_instance.expected_system_id, cluster.replication.maximum_lag_on_failover | default(1048576)) }}"

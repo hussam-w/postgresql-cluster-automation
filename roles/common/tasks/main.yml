@@ -1,0 +1,36 @@
+---
+- name: Resolve opt-in modular cluster components without changing legacy policy
+  ansible.builtin.set_fact:
+    cluster: '{{ cluster | cluster_components(postgresql_deployment) }}'
+  when: (postgresql_deployment | default({})).get('architecture') == 'modular'
+
+- name: Resolve matching PostgreSQL model and package major before component changes
+  ansible.builtin.assert:
+    that:
+      - postgresql_major | int >= 14
+      - postgresql_version is not defined or postgresql_major == postgresql_version
+    fail_msg: 'Selected major must match server/client package pins; no binary fallback or major upgrade is allowed.'
+
+- name: Resolve optional storage policy for component entry points
+  ansible.builtin.include_role:
+    name: storage_layout
+  when: storage_layout is defined and storage_paths is not defined
+
+- name: Preserve existing data when selected PostgreSQL major changes
+  postgres_binary_info:
+    major: '{{ postgresql_major }}'
+    data_dir: '{{ cluster.data_dir }}'
+    require_binaries: false
+  when: cluster.data_dir is defined and cluster.data_dir is string
+
+- name: Require the guarded layout for external HA WAL
+  ansible.builtin.assert:
+    that: cluster.wal_dir is not defined or (storage_paths is defined and cluster.wal_dir == storage_paths.wal_dir)
+    fail_msg: 'External WAL requires the opt-in storage_layout resolver and mount admission; no direct relocation is allowed.'
+
+- name: Refuse to continue a dependent play after any target failed
+  ansible.builtin.assert:
+    that: ansible_play_hosts | sort == ansible_play_hosts_all | sort
+    quiet: true
+    fail_msg: A target failed earlier; stop this run and resolve the failure before continuing.
+  run_once: true

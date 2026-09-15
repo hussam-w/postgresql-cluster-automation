@@ -1,0 +1,8 @@
+[Unit]
+Description=Scheduled logical PostgreSQL backups
+[Timer]
+OnCalendar={{ backup_schedule | default('*-*-* 02:15:00 UTC') }}
+Persistent=true
+RandomizedDelaySec=300
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+---
+- name: Require admitted storage before any package configuration or initialization
+  storage_mount_guard:
+    paths: '{{ storage_paths }}'
+    backup_required: "{{ (postgresql_deployment | default({})).get('mode') == 'standalone' or inventory_hostname == (backup_repository_host | default('')) }}"
+    min_free_bytes: "{{ (standalone | default({})).get('min_free_bytes', 10737418240) if (postgresql_deployment | default({})).get('mode') == 'standalone' else cluster.min_free_bytes }}"
+  when: storage_paths is defined

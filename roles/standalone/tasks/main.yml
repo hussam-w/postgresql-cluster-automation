@@ -1,0 +1,254 @@
+---
+- name: Merge standalone defaults without requiring duplicated configuration
+  ansible.builtin.set_fact:
+    standalone: '{{ standalone_defaults | combine(standalone | default({}), recursive=true) }}'
+- name: Validate standalone paths ownership and operating system
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu' and ansible_distribution_version == '22.04'
+      - standalone.name is match('^[a-z][a-z0-9_-]{0,30}$')
+      - standalone.data_dir is match('^/(srv|data|var/lib/postgresql|home/[a-zA-Z0-9_-]+)/[a-zA-Z0-9_/-]+$')
+      - "'..' not in standalone.data_dir"
+      - standalone.storage_mount is string
+      - standalone.port is integer and standalone.port > 0 and standalone.port < 65536
+      - standalone.max_connections is integer and standalone.max_connections >= 10
+      - standalone.shared_buffers_mb is integer and standalone.shared_buffers_mb >= 32
+      - standalone.locale is match('^[a-zA-Z0-9_.@-]+$')
+      - standalone.listen_address == '' or standalone.listen_address in ansible_all_ipv4_addresses
+      - not standalone.listen_address or standalone.tls is defined
+      - not standalone.listen_address or standalone.client_cidrs | length > 0
+      - standalone.min_free_bytes is integer and standalone.min_free_bytes > 0
+      - standalone.wal_dir is not defined or (storage_paths is defined and standalone.wal_dir == storage_paths.wal_dir)
+    fail_msg: 'Standalone requires reviewed existing storage, safe paths, qualified OS and TLS for TCP access.'
+- name: Validate client networks before rendering HBA records
+  ansible.builtin.command:
+    argv: [python3, '-c', 'import ipaddress,json,sys; values=json.loads(sys.argv[1]); assert isinstance(values,list); [ipaddress.ip_network(v, strict=True) for v in values]', '{{ standalone.client_cidrs | to_json }}']
+  changed_when: false
+- name: Validate TLS paths before configuration interpolation
+  ansible.builtin.assert:
+    that:
+      - item is match('^/[a-zA-Z0-9_./-]+$')
+      - "'..' not in item"
+  loop: '{{ [standalone.tls.cert, standalone.tls.key, standalone.tls.ca] }}'
+  when: standalone.listen_address | length > 0
+- name: Inspect the existing storage mount without creating a filesystem
+  ansible.builtin.command:
+    argv: [findmnt, '-J', '-M', '{{ standalone.storage_mount }}', '-o', 'TARGET,FSTYPE,OPTIONS']
+  changed_when: false
+  register: standalone_mount
+- name: Resolve the data path before creating anything
+  ansible.builtin.command:
+    argv: [readlink, '-m', '{{ standalone.data_dir }}']
+  register: standalone_realpath
+  changed_when: false
+- name: Require the data directory inside the approved writable filesystem
+  ansible.builtin.assert:
+    that:
+      - (standalone_mount.stdout | from_json).filesystems[0].fstype in ['ext4', 'xfs']
+      - "'ro' not in (standalone_mount.stdout | from_json).filesystems[0].options.split(',')"
+      - standalone.storage_mount == '/' or standalone.data_dir.startswith(standalone.storage_mount.rstrip('/') ~ '/')
+      - standalone_realpath.stdout == standalone.data_dir
+- name: Inspect target and ownership record before changes
+  ansible.builtin.stat:
+    path: '{{ item }}'
+  loop:
+    - '{{ standalone.data_dir }}'
+    - '/var/lib/pg-standalone-{{ standalone.name }}.json'
+    - '/etc/systemd/system/pg-standalone-{{ standalone.name }}.service'
+  register: standalone_existing
+- name: Preserve every existing instance and refuse partial or foreign ownership
+  ansible.builtin.assert:
+    that:
+      - standalone_existing.results[1].stat.exists or not standalone_existing.results[0].stat.exists
+      - standalone_existing.results[1].stat.exists or not standalone_existing.results[2].stat.exists
+      - not standalone_existing.results[1].stat.exists or (standalone_existing.results[1].stat.isreg and standalone_existing.results[1].stat.uid == 0 and standalone_existing.results[1].stat.mode == '0600')
+    fail_msg: 'Existing data/unit without completed ownership: preserve it. Use configure with an explicit existing-instance endpoint; never reinitialize.'
+- name: Read completed standalone ownership
+  ansible.builtin.slurp:
+    src: '/var/lib/pg-standalone-{{ standalone.name }}.json'
+  register: standalone_identity
+  when: standalone_existing.results[1].stat.exists
+- name: Require unchanged owned deployment policy on re-execution
+  ansible.builtin.assert:
+    that: (standalone_identity.content | b64decode | from_json).policy == standalone
+    fail_msg: 'Owned standalone policy differs. Plan controlled configuration maintenance instead of reprovisioning.'
+  when: standalone_existing.results[1].stat.exists
+- name: Confirm adequate free storage without modifying the filesystem
+  ansible.builtin.command:
+    argv: [python3, '-c', 'import os,sys; s=os.statvfs(sys.argv[1]); print(s.f_bavail*s.f_frsize)', '{{ standalone.storage_mount }}']
+  register: standalone_free
+  changed_when: false
+- name: Require approved free capacity
+  ansible.builtin.assert:
+    that: standalone_free.stdout | int >= standalone.min_free_bytes
+- name: Provision only a newly admitted standalone instance
+  when: not standalone_existing.results[1].stat.exists
+  block:
+    - name: Refuse existing PostgreSQL/etcd data elsewhere before fresh installation
+      ansible.builtin.assert:
+        that:
+          - environment_scan.report.coverage_complete
+          - environment_scan.report.data_search_scope == 'standard roots and mounted filesystems'
+          - environment_scan.report.data_state_markers | length == 0
+          - postgresql_provision_confirmation | default('') == 'PROVISION ' ~ inventory_hostname
+    - name: Install only standalone and selected extension packages
+      ansible.builtin.include_role:
+        name: packages_safe
+      vars:
+        component_packages: "{{ (['postgresql-common', 'postgresql-' ~ postgresql_deployment.major, 'postgresql-client-' ~ postgresql_deployment.major] + hostvars.localhost.deployment_model.extensions.packages) | unique | list }}"
+        component_package_versions: '{{ postgresql_package_versions }}'
+    - name: Verify the selected PostgreSQL binaries before creating data
+      postgres_binary_info:
+        major: '{{ postgresql_deployment.major }}'
+        data_dir: '{{ standalone.data_dir }}'
+    - name: Confirm every selected extension control file before initdb
+      ansible.builtin.stat:
+        path: '/usr/share/postgresql/{{ postgresql_deployment.major }}/extension/{{ item }}.control'
+      loop: '{{ hostvars.localhost.deployment_model.extensions.extensions }}'
+      register: standalone_controls
+    - name: Refuse unavailable selected extensions before creating database data
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.isreg
+      loop: '{{ standalone_controls.results }}'
+    - name: Validate supplied TLS for TCP before initializing a database
+      ansible.builtin.command:
+        argv: [openssl, verify, '-CAfile', '{{ standalone.tls.ca }}', '{{ standalone.tls.cert }}']
+      changed_when: false
+      when: standalone.listen_address | length > 0
+    - name: Validate the TCP certificate IP identity and remaining lifetime
+      ansible.builtin.command:
+        argv: [openssl, x509, '-in', '{{ standalone.tls.cert }}', '-noout', '-checkip', '{{ standalone.listen_address }}', '-checkend', '2592000']
+      changed_when: false
+      when: standalone.listen_address | length > 0
+    - name: Validate PostgreSQL can read the matching TLS certificate and protected key
+      ansible.builtin.command:
+        argv:
+          - python3
+          - '-c'
+          - 'import os,ssl,stat,sys; s=os.stat(sys.argv[2]); assert stat.S_ISREG(s.st_mode) and s.st_uid==os.geteuid() and s.st_mode & 0o077==0; c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain(sys.argv[1],sys.argv[2])'
+          - '{{ standalone.tls.cert }}'
+          - '{{ standalone.tls.key }}'
+      become_user: postgres
+      changed_when: false
+      when: standalone.listen_address | length > 0
+    - name: Create only the newly admitted data directory
+      ansible.builtin.file:
+        path: '{{ standalone.data_dir }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+    - name: Create the admitted new WAL directory without changing its parent mount
+      ansible.builtin.file:
+        path: '{{ standalone.wal_dir }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: standalone.wal_dir is defined
+    - name: Inspect the reserved backup repository directory
+      ansible.builtin.stat:
+        path: '{{ storage_paths.backup_dir }}'
+      register: standalone_backup_path
+      when: storage_paths is defined
+    - name: Prepare only a missing backup directory without configuring a backup product
+      ansible.builtin.file:
+        path: '{{ storage_paths.backup_dir }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: storage_paths is defined and not standalone_backup_path.stat.exists
+    - name: Initialize the explicitly new standalone instance with checksums
+      ansible.builtin.command:
+        # initdb creates pg_wal's native link only for a NEW admitted database.
+        argv: "{{ ['/usr/lib/postgresql/' ~ postgresql_deployment.major ~ '/bin/initdb', '-D', standalone.data_dir, '--data-checksums', '--auth-local=peer', '--auth-host=scram-sha-256', '--locale=' ~ standalone.locale] + (['--waldir=' ~ standalone.wal_dir] if standalone.wal_dir is defined else []) }}"
+        creates: '{{ standalone.data_dir }}/PG_VERSION'
+      become_user: postgres
+    - name: Preserve initial configuration and render standalone-only settings
+      ansible.builtin.template:
+        src: '{{ item.src }}'
+        dest: '{{ standalone.data_dir }}/{{ item.dest }}'
+        owner: postgres
+        group: postgres
+        mode: '0600'
+        backup: true
+      loop:
+        - {src: postgresql.conf.j2, dest: postgresql.conf}
+        - {src: pg_hba.conf.j2, dest: pg_hba.conf}
+    - name: Natively parse standalone configuration before starting it
+      ansible.builtin.command:
+        argv: ['/usr/lib/postgresql/{{ postgresql_deployment.major }}/bin/postgres', '-D', '{{ standalone.data_dir }}', '-C', shared_preload_libraries]
+      become_user: postgres
+      changed_when: false
+    - name: Install only the standalone service unit
+      ansible.builtin.template:
+        src: postgresql.service.j2
+        dest: '/etc/systemd/system/pg-standalone-{{ standalone.name }}.service'
+        mode: '0644'
+        backup: true
+    - name: Validate the new standalone unit
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, '/etc/systemd/system/pg-standalone-{{ standalone.name }}.service']
+      changed_when: false
+    - name: Start only the new standalone instance
+      ansible.builtin.systemd_service:
+        name: 'pg-standalone-{{ standalone.name }}'
+        daemon_reload: true
+        enabled: true
+        state: started
+    - name: Wait for the new local socket without restarting the service
+      ansible.builtin.wait_for:
+        path: '/run/pg-standalone-{{ standalone.name }}/.s.PGSQL.{{ standalone.port }}'
+        timeout: 30
+- name: Inspect standalone runtime without restarting existing services
+  postgres_reconcile:
+    socket_dir: '/run/pg-standalone-{{ standalone.name }}'
+    port: '{{ standalone.port }}'
+    manager: standalone
+    operation: plan
+  register: standalone_runtime
+- name: Require expected version role and retained lineage
+  ansible.builtin.assert:
+    that:
+      - not standalone_runtime.report.identity.in_recovery
+      - standalone_runtime.report.identity.version | int // 10000 == postgresql_deployment.major | int
+      - not standalone_existing.results[1].stat.exists or standalone_runtime.report.identity.system_id == (standalone_identity.content | b64decode | from_json).system_id
+- name: Inspect native HBA and configuration parse errors
+  ansible.builtin.command:
+    argv: [psql, '-X', '-w', '-h', '/run/pg-standalone-{{ standalone.name }}', '-p', '{{ standalone.port | string }}', '-d', postgres, '-Atc', 'SELECT (SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL) + (SELECT count(*) FROM pg_file_settings WHERE error IS NOT NULL)']
+  become_user: postgres
+  changed_when: false
+  register: standalone_parse_errors
+- name: Refuse completion when native configuration parsing reports errors
+  ansible.builtin.assert:
+    that: standalone_parse_errors.stdout == '0'
+- name: Record completed ownership only after successful SQL verification
+  ansible.builtin.set_fact:
+    standalone_files_to_verify:
+      - '{{ standalone.data_dir }}/postgresql.conf'
+      - '{{ standalone.data_dir }}/pg_hba.conf'
+      - '/etc/systemd/system/pg-standalone-{{ standalone.name }}.service'
+- name: Inspect managed configuration fingerprints without exposing contents
+  ansible.builtin.stat:
+    path: '{{ item }}'
+    checksum_algorithm: sha256
+  loop: '{{ standalone_files_to_verify }}'
+  register: standalone_fingerprints
+- name: Build the protected standalone configuration fingerprint
+  ansible.builtin.set_fact:
+    standalone_current_files: "{{ dict(standalone_fingerprints.results | map(attribute='item') | zip(standalone_fingerprints.results | map(attribute='stat.checksum'))) }}"
+- name: Refuse drift instead of replacing existing configuration
+  ansible.builtin.assert:
+    that: standalone_current_files == (standalone_identity.content | b64decode | from_json).files
+    fail_msg: 'Configuration drift detected; preserve files and use controlled maintenance.'
+  when: standalone_existing.results[1].stat.exists
+- name: Record completed ownership only after successful SQL verification
+  ansible.builtin.copy:
+    content: "{{ {'policy': standalone, 'system_id': standalone_runtime.report.identity.system_id, 'files': standalone_current_files} | to_nice_json }}"
+    dest: '/var/lib/pg-standalone-{{ standalone.name }}.json'
+    owner: root
+    group: root
+    mode: '0600'
+    force: false
+  when: not standalone_existing.results[1].stat.exists

@@ -1,0 +1,153 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: restore-verify
+
+- name: Verify restore on an isolated directory and Unix socket
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    restore_binary_dir: "/usr/lib/postgresql/{{ (postgresql_deployment | default({})) | postgres_major(cluster.packages) }}/bin"
+  tasks:
+    - name: Verify restore target is explicitly isolated from live data
+      ansible.builtin.assert:
+        that:
+          - storage_layout is not defined and cluster.wal_dir is not defined
+          - restore_test_confirmation | default('') == 'TEST ISOLATED RESTORE'
+          - restore_test_dir is match('^/srv/postgres/restore-acceptance-[a-z0-9_-]+$')
+          - restore_test_dir != cluster.data_dir
+          - restore_recovery_type | default('immediate') in ['immediate', 'time']
+          - restore_recovery_type | default('immediate') != 'time' or restore_target_time | default('') is match('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:.]+\+00$')
+        fail_msg: 'Use the qualified legacy restore layout only. External WAL needs a separately qualified isolated restore mapping; never replay a live WAL link.'
+      when: inventory_hostname == backup_repository_host
+    - name: Inspect isolated target before restore
+      ansible.builtin.stat:
+        path: '{{ restore_test_dir }}'
+      register: restore_target
+      when: inventory_hostname == backup_repository_host
+    - name: Refuse to overwrite any previous restore result
+      ansible.builtin.assert:
+        that: not restore_target.stat.exists
+      when: inventory_hostname == backup_repository_host
+    - name: Create isolated restore socket directory
+      ansible.builtin.file:
+        path: /run/pg-ha-restore-test
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: inventory_hostname == backup_repository_host
+    - name: Create only the verified fresh restore directory with database ownership
+      ansible.builtin.file:
+        path: '{{ restore_test_dir }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: inventory_hostname == backup_repository_host
+    - name: Restore and inspect the recovered database
+      when: inventory_hostname == backup_repository_host
+      block:
+        - name: Restore backup and replay WAL to a consistent recovery point
+          ansible.builtin.command:
+            argv: "{{ ['pgbackrest', '--stanza=' ~ cluster.name, '--pg1-path=' ~ restore_test_dir, '--type=' ~ (restore_recovery_type | default('immediate')), '--target-action=promote', 'restore'] + (['--target=' ~ restore_target_time] if restore_recovery_type | default('immediate') == 'time' else []) }}"
+          become_user: postgres
+        - name: Start recovered PostgreSQL with no TCP listener and no WAL archiving
+          ansible.builtin.command:
+            argv:
+              - '{{ restore_binary_dir }}/pg_ctl'
+              - -D
+              - '{{ restore_test_dir }}'
+              - -l
+              - '{{ restore_test_dir }}/acceptance.log'
+              - -o
+              - "-c data_directory={{ restore_test_dir }} -c hba_file={{ restore_test_dir }}/pg_hba.conf -c ident_file={{ restore_test_dir }}/pg_ident.conf -c listen_addresses='' -c unix_socket_directories=/run/pg-ha-restore-test -c port=55432 -c archive_mode=off -c synchronous_standby_names=''"
+              - -w
+              - -t
+              - '120'
+              - start
+          become_user: postgres
+        - name: Validate recovered system identity and application database presence
+          community.postgresql.postgresql_query:
+            login_unix_socket: /run/pg-ha-restore-test
+            login_port: 55432
+            query: SELECT system_identifier::text, pg_is_in_recovery() AS recovery FROM pg_control_system()
+          become_user: postgres
+          register: restored_identity
+          retries: 60
+          delay: 2
+          until: restored_identity is succeeded and not restored_identity.query_result[0].recovery
+        - name: Compare restored and live system identity
+          community.postgresql.postgresql_query:
+            login_unix_socket: /run/pg-ha-patroni
+            login_port: "{{ cluster.ports.postgres | default(5432) }}"
+            query: SELECT system_identifier::text FROM pg_control_system()
+          become_user: postgres
+          register: live_identity
+        - name: Require an independently recovered database with matching lineage
+          ansible.builtin.assert:
+            that:
+              - not restored_identity.query_result[0].recovery
+              - restored_identity.query_result[0].system_identifier == live_identity.query_result[0].system_identifier
+        - name: Query every restored application database
+          community.postgresql.postgresql_query:
+            login_unix_socket: /run/pg-ha-restore-test
+            login_port: 55432
+            login_db: '{{ item.name }}'
+            query: SELECT current_database(), pg_is_in_recovery()
+          loop: '{{ application_databases }}'
+          become_user: postgres
+        - name: Verify the committed endpoint acceptance marker survived the restore
+          community.postgresql.postgresql_query:
+            login_unix_socket: /run/pg-ha-restore-test
+            login_port: 55432
+            login_db: '{{ application_databases[0].name }}'
+            query: SELECT count(*) AS markers FROM public.pg_ha_acceptance WHERE id=1 AND note='durable acceptance marker'
+          become_user: postgres
+          register: restored_marker
+        - name: Require restored application data, not only an empty database
+          ansible.builtin.assert:
+            that: restored_marker.query_result[0].markers | int == 1
+        - name: Record successful isolated recovery evidence
+          ansible.builtin.copy:
+            backup: true
+            content: "{{ {'restore_directory': restore_test_dir, 'identity': restored_identity.query_result[0], 'tcp_listener': false, 'application_databases': application_databases | map(attribute='name') | list} | to_nice_json }}"
+            dest: '{{ playbook_dir }}/../artifacts/restore-evidence.json'
+            mode: '0600'
+          delegate_to: localhost
+          become: false
+        - name: Verify recovery stopped between the two committed temporal markers
+          community.postgresql.postgresql_query:
+            login_unix_socket: /run/pg-ha-restore-test
+            login_port: 55432
+            login_db: '{{ application_databases[0].name }}'
+            query: "SELECT array_agg(id ORDER BY id) AS markers FROM {{ pitr_table | default('pg_ha_pitr_acceptance') }}"
+          become_user: postgres
+          register: recovered_temporal_markers
+          when: restore_recovery_type | default('immediate') == 'time'
+        - name: Require the earlier commit and exclude the later commit
+          ansible.builtin.assert:
+            that: recovered_temporal_markers.query_result[0].markers == [1]
+          when: restore_recovery_type | default('immediate') == 'time'
+        - name: Record verified point-in-time recovery evidence
+          ansible.builtin.copy:
+            backup: true
+            content: "{{ {'target_time': restore_target_time, 'restore_directory': restore_test_dir, 'markers': recovered_temporal_markers.query_result[0].markers, 'identity': restored_identity.query_result[0], 'tcp_listener': false} | to_nice_json }}"
+            dest: '{{ playbook_dir }}/../artifacts/pitr-evidence.json'
+            mode: '0600'
+          delegate_to: localhost
+          become: false
+          when: restore_recovery_type | default('immediate') == 'time'
+      always:
+        - name: Check whether isolated recovered server is still running
+          ansible.builtin.stat:
+            path: '{{ restore_test_dir }}/postmaster.pid'
+          register: restore_pid
+        - name: Stop only the isolated recovered server and retain its evidence
+          ansible.builtin.command:
+            argv: ['{{ restore_binary_dir }}/pg_ctl', -D, '{{ restore_test_dir }}', -m, fast, -w, stop]
+          become_user: postgres
+          when: restore_pid.stat.exists

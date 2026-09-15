@@ -1,0 +1,17 @@
+platform_ports:
+  postgres: 5432
+  pgbouncer: 6432
+  patroni: 8008
+  etcd_client: 2379
+  etcd_peer: 2380
+  write: 5000
+  read: 5001
+  backup: 8432
+platform_change_confirmation: ''
+
+# Infrastructure ownership is opt-in, even during fresh provisioning.
+platform_manage_storage: false
+platform_manage_network: false
+platform_manage_hosts: false
+platform_manage_firewall: false
+platform_manage_watchdog: false

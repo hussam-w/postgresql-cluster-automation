@@ -1,0 +1,33 @@
+---
+- name: Copy protected TLS inputs
+  ansible.builtin.copy:
+    backup: true
+    src: "{{ tls_sources[tls_service.service][item] }}"
+    dest: "/etc/pg-ha/{{ tls_service.service }}/{{ item }}.pem"
+    owner: "{{ tls_service.owner }}"
+    group: "{{ tls_service.owner }}"
+    mode: "{{ '0600' if item == 'key' else '0640' }}"
+  loop: [ca, cert, key]
+  no_log: true
+  diff: false
+
+- name: Verify certificate chain and node DNS identity using OpenSSL
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/openssl
+      - verify
+      - -CAfile
+      - "/etc/pg-ha/{{ tls_service.service }}/ca.pem"
+      - -verify_hostname
+      - "{{ node.dns_name }}"
+      - -untrusted
+      - "/etc/pg-ha/{{ tls_service.service }}/cert.pem"
+      - "/etc/pg-ha/{{ tls_service.service }}/cert.pem"
+  changed_when: false
+  # Certificate cryptographic validation requires OpenSSL, not a text/YAML assertion.
+
+- name: Verify pool certificate covers the client-facing VIP DNS name
+  ansible.builtin.command:
+    argv: [/usr/bin/openssl, verify, -CAfile, /etc/pg-ha/pgbouncer/ca.pem, -verify_hostname, "{{ cluster.vip_dns_name }}", -untrusted, /etc/pg-ha/pgbouncer/cert.pem, /etc/pg-ha/pgbouncer/cert.pem]
+  changed_when: false
+  when: tls_service.service == 'pgbouncer'

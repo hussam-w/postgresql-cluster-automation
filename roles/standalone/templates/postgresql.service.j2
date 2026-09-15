@@ -1,0 +1,29 @@
+[Unit]
+Description=Managed standalone PostgreSQL {{ postgresql_deployment.major }} ({{ standalone.name }})
+After=network.target
+RequiresMountsFor={{ standalone.data_dir }}
+{% if standalone.wal_dir is defined %}
+RequiresMountsFor={{ standalone.wal_dir }}
+{% endif %}
+{% if storage_paths is defined %}
+AssertPathIsMountPoint={{ storage_paths.data_mount }}
+{% endif %}
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+RuntimeDirectory=pg-standalone-{{ standalone.name }}
+RuntimeDirectoryMode=0750
+ExecStart=/usr/lib/postgresql/{{ postgresql_deployment.major }}/bin/postgres -D {{ standalone.data_dir }}
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGINT
+TimeoutStopSec=300
+Restart=no
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

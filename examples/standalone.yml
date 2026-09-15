@@ -1,0 +1,31 @@
+---
+# Global extra-vars file. Inventory must contain only pg01 in postgres_cluster,
+# and no etcd_cluster or routers. Replace all site-specific values after discovery.
+# Change this one major selection; provide matching exact package pins.
+postgresql_version: '17'
+postgresql_deployment:
+  mode: standalone
+  major: '{{ postgresql_version }}'
+  topology:
+    primary: pg01
+    total_nodes: 1
+    replicas: []
+    standby: []
+  extensions: [pgcrypto]
+  extension_databases: [postgres]
+postgresql_operation: plan
+standalone:
+  name: main
+  data_dir: /srv/postgresql/data
+  storage_mount: /srv/postgresql
+  port: 5432
+  listen_address: ''
+  client_cidrs: []
+  shared_buffers_mb: 128
+  max_connections: 100
+  min_free_bytes: 10737418240
+  locale: C.UTF-8
+# Populate exact repository versions; empty pins intentionally prevent installation.
+postgresql_package_versions: {}
+postgresql_allow_package_install: false
+postgresql_allow_extension_create: false

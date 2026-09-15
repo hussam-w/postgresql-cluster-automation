@@ -1,0 +1,77 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: ip-migration-certificates
+
+- name: Correct DCS peer IP certificate identities while preserving membership
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    deployment_mode: verify
+  roles: [common]
+  tasks:
+    - name: Verify the committed managed baseline before the certificate-only change
+      ansible.builtin.include_role:
+        name: health
+        tasks_from: integrity.yml
+    - name: Capture recent etcd transport diagnostics
+      ansible.builtin.command:
+        argv: [journalctl, -u, pg-ha-etcd, -n, '45', --no-pager]
+      changed_when: false
+      register: migration_etcd_log
+    - name: Save nonsecret coordination transport evidence
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ migration_etcd_log.stdout }}'
+        dest: '{{ playbook_dir }}/../artifacts/ip-migration-etcd-{{ inventory_hostname }}.log'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+    - name: Install same-key same-CA leaves with the actual source IP SAN
+      ansible.builtin.copy:
+        src: '{{ migration_certificate_dir }}/{{ inventory_hostname }}-{{ item }}.pem'
+        dest: '/etc/pg-ha/{{ item }}/cert.pem'
+        owner: "{{ 'etcd' if item == 'etcd' else 'postgres' }}"
+        group: "{{ 'etcd' if item == 'etcd' else 'postgres' }}"
+        mode: '0640'
+        backup: true
+      loop: [etcd, dcs]
+    - name: Verify actual node IP identity and issuing trust
+      ansible.builtin.command:
+        argv: [openssl, verify, -CAfile, '/etc/pg-ha/{{ item }}/ca.pem', -verify_ip, '{{ ansible_host }}', '/etc/pg-ha/{{ item }}/cert.pem']
+      loop: [etcd, dcs]
+      changed_when: false
+    - name: Validate private key pairing and domain separation
+      cluster_tls_check:
+        core: true
+    - name: Wait for etcd TLS certificate reload on new peer connections
+      ansible.builtin.command:
+        argv: ['{{ etcd_binary_dir }}/etcdctl', '--endpoints=https://{{ node.dns_name }}:{{ cluster.ports.etcd_client }}', --cacert=/etc/pg-ha/etcd/ca.pem, --cert=/etc/pg-ha/etcd/cert.pem, --key=/etc/pg-ha/etcd/key.pem, endpoint, health, --cluster]
+      register: migrated_certificate_health
+      retries: 30
+      delay: 2
+      until: migrated_certificate_health.rc == 0
+      changed_when: false
+    - name: Inspect only changed certificate fingerprints
+      ansible.builtin.stat:
+        path: '/etc/pg-ha/{{ item }}/cert.pem'
+        checksum_algorithm: sha256
+      loop: [etcd, dcs]
+      register: migrated_certificate_stats
+    - name: Advance only authenticated certificate entries in baseline
+      ansible.builtin.set_fact:
+        managed_fingerprint: "{{ managed_fingerprint | combine({('/etc/pg-ha/' ~ item.item ~ '/cert.pem'): {'sha256': item.stat.checksum, 'uid': item.stat.uid, 'gid': item.stat.gid, 'mode': item.stat.mode}}) }}"
+      loop: '{{ migrated_certificate_stats.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+    - name: Persist the reviewed certificate-only baseline
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ managed_fingerprint | to_nice_json }}'
+        dest: /var/lib/pg-ha/files.json
+        owner: root
+        group: root
+        mode: '0600'

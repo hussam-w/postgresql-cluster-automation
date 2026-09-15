@@ -1,0 +1,81 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: repair-watchdog-startup
+
+- name: Repair and validate the recorded watchdog startup integration
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    deployment_mode: verify
+  roles: [common]
+  tasks:
+    - name: Verify existing managed files before changing the startup contract
+      ansible.builtin.include_role:
+        name: health
+        tasks_from: integrity.yml
+    - name: Install watchdog boot readiness
+      ansible.builtin.include_role:
+        name: platform
+        tasks_from: watchdog-startup.yml
+    - name: Install the narrowly changed Patroni startup dependency
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../roles/patroni/templates/pg-ha-patroni.service.j2'
+        dest: /etc/systemd/system/pg-ha-patroni.service
+        owner: root
+        group: root
+        mode: '0644'
+        backup: true
+    - name: Validate both units together
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, /etc/systemd/system/pg-ha-watchdog.service, /etc/systemd/system/pg-ha-patroni.service]
+      changed_when: false
+    - name: Reload systemd dependency graph without restarting healthy databases
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+    - name: Read current local role before repairing a failed watchdog state
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:{{ patroni_port }}/patroni'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+      register: startup_role
+    - name: Refuse an unplanned restart of a primary
+      ansible.builtin.assert:
+        that: not (startup_role.json.watchdog_failed | default(false)) or startup_role.json.role == 'replica'
+    - name: Restart only a replica whose watchdog initialization failed at boot
+      ansible.builtin.systemd_service:
+        name: pg-ha-patroni
+        state: restarted
+      when: startup_role.json.watchdog_failed | default(false)
+    - name: Require healthy watchdog capability and running database after repair
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:{{ patroni_port }}/patroni'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+      register: startup_recovered
+      retries: 60
+      delay: 2
+      until: startup_recovered.status == 200 and startup_recovered.json.state == 'running' and not (startup_recovered.json.watchdog_failed | default(false))
+    - name: Fingerprint only the reviewed changed unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/pg-ha-patroni.service
+        checksum_algorithm: sha256
+      register: startup_unit
+    - name: Advance only this unit in the already verified configuration baseline
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ (managed_fingerprint | combine({'/etc/systemd/system/pg-ha-patroni.service': {'sha256': startup_unit.stat.checksum, 'uid': startup_unit.stat.uid, 'gid': startup_unit.stat.gid, 'mode': startup_unit.stat.mode}})) | to_nice_json }}"
+        dest: /var/lib/pg-ha/files.json
+        owner: root
+        group: root
+        mode: '0600'
+- name: Verify all nodes after boot integration repair
+  ansible.builtin.import_playbook: verify.yml

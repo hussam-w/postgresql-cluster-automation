@@ -1,0 +1,40 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: deploy
+
+- name: Provision platform resources
+  ansible.builtin.import_playbook: platform.yml
+
+- name: Record the effective provisioned firewall policy and check VIP conflict
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect effective firewall policy
+      firewall_policy_info:
+      register: effective_firewall
+    - name: Attach effective firewall fingerprint to host policy
+      ansible.builtin.set_fact:
+        node: "{{ node | combine({'firewall_sha256': effective_firewall.sha256}) }}"
+    - name: Persist nonsecret node policy for subsequent independent verification
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'node': node} | to_nice_yaml }}"
+        dest: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/platform.yml"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+    - name: Confirm selected VIP has no current ARP owner before bootstrap
+      ansible.builtin.command:
+        argv: [arping, -D, -c, '3', -w, '5', -I, '{{ node.interface }}', '{{ cluster.vip }}']
+      changed_when: false
+      when: deployment_mode == 'bootstrap'
+
+- name: Provision archive integration and encrypted backup transport
+  ansible.builtin.import_playbook: backup-platform.yml
+
+- name: Bootstrap the validated cluster
+  ansible.builtin.import_playbook: provision-cluster.yml

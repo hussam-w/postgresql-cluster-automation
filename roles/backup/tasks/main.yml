@@ -1,0 +1,104 @@
+---
+- name: Validate opt-in mounted storage before backup changes
+  ansible.builtin.include_role:
+    name: storage_guard
+
+- name: Install pinned backup implementation
+  ansible.builtin.apt:
+    name: "pgbackrest={{ backup_package_version }}"
+    state: present
+    policy_rc_d: 101
+    lock_timeout: 600
+  register: backup_packages
+  retries: 20
+  delay: 15
+  until: backup_packages is succeeded
+
+- name: Prepare private backup configuration and writable runtime paths
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+  loop: [/etc/pgbackrest, /var/log/pgbackrest, /var/lib/pgbackrest, /var/lib/pgbackrest/lock, /var/lib/pgbackrest/spool]
+
+- name: Create encrypted repository only on selected repository host
+  ansible.builtin.file:
+    path: "{{ backup_repository_path }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: '0700'
+  when: inventory_hostname == backup_repository_host
+
+- name: Install dedicated backup transport trust domain
+  ansible.builtin.copy:
+    backup: true
+    src: "{{ tls_sources.backup[item] }}"
+    dest: "/etc/pgbackrest/{{ item }}.pem"
+    owner: postgres
+    group: postgres
+    mode: '0600'
+  loop: [ca, cert, key]
+  no_log: true
+  diff: false
+
+- name: Render encrypted repository and mutually authenticated transport policy
+  ansible.builtin.template:
+    backup: true
+    src: pgbackrest.conf.j2
+    dest: /etc/pgbackrest/pgbackrest.conf
+    owner: postgres
+    group: postgres
+    mode: '0600'
+  no_log: true
+  diff: false
+  register: backup_configuration
+
+- name: Parse backup configuration without requiring initialized PostgreSQL
+  ansible.builtin.command:
+    argv: [pgbackrest, help, backup]
+  become_user: postgres
+  changed_when: false
+  no_log: true
+
+- name: Prepare root-owned integration executable directory
+  ansible.builtin.file:
+    path: /usr/local/libexec/pg-ha
+    state: directory
+    mode: '0755'
+
+- name: Install narrowly scoped WAL archive and restore entrypoints
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      #!/bin/sh
+      set -eu
+      test "$#" -eq 2
+      exec /usr/bin/pgbackrest --stanza={{ cluster.name }} {{ 'archive-push "$1"' if item == 'archive-wal' else 'archive-get "$1" "$2"' }}
+    dest: "/usr/local/libexec/pg-ha/{{ item }}"
+    owner: root
+    group: root
+    mode: '0755'
+  loop: [archive-wal, restore-wal]
+
+- name: Install dedicated TLS backup protocol service
+  ansible.builtin.template:
+    backup: true
+    src: pg-ha-backup.service.j2
+    dest: /etc/systemd/system/pg-ha-backup.service
+    mode: '0644'
+  register: backup_unit
+
+- name: Natively validate backup service unit
+  ansible.builtin.command:
+    argv: [systemd-analyze, verify, /etc/systemd/system/pg-ha-backup.service]
+  changed_when: false
+
+- name: Start or reload only the changed backup transport
+  ansible.builtin.systemd_service:
+    name: pg-ha-backup
+    enabled: true
+    daemon_reload: true
+    state: "{{ 'restarted' if backup_configuration.changed or backup_unit.changed else 'started' }}"

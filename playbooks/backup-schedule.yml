@@ -1,0 +1,75 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: backup-schedule
+
+- name: Schedule accepted full backups on the repository node
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Verify a successful backup exists before enabling scheduling
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', --output=json, info]
+      become_user: postgres
+      changed_when: false
+      register: scheduled_backup_info
+      failed_when: scheduled_backup_info.rc != 0 or (scheduled_backup_info.stdout | from_json)[0].status.code != 0
+      when: inventory_hostname == backup_repository_host
+    - name: Install repository backup service
+      ansible.builtin.copy:
+        backup: true
+        content: |
+          [Unit]
+          Description=Encrypted PostgreSQL full backup
+          After=pg-ha-backup.service
+          {% if storage_paths is defined %}
+          RequiresMountsFor={{ storage_paths.backup_mount }}
+          AssertPathIsMountPoint={{ storage_paths.backup_mount }}
+          {% endif %}
+          [Service]
+          Type=oneshot
+          User=postgres
+          Group=postgres
+          ExecStart=/usr/bin/pgbackrest --stanza={{ cluster.name }} --type=full backup
+          TimeoutStartSec=3600
+          Nice=10
+          IOSchedulingClass=best-effort
+          IOSchedulingPriority=7
+          NoNewPrivileges=true
+          ProtectHome=true
+          ProtectSystem=strict
+          ReadWritePaths={{ backup_repository_path }} /var/log/pgbackrest /var/lib/pgbackrest
+        dest: /etc/systemd/system/pg-ha-full-backup.service
+        mode: '0644'
+      when: inventory_hostname == backup_repository_host
+    - name: Install daily backup timer with catch-up after downtime
+      ansible.builtin.copy:
+        backup: true
+        content: |
+          [Unit]
+          Description=Daily PostgreSQL backup schedule
+          [Timer]
+          OnCalendar={{ backup_schedule | default('*-*-* 02:15:00 UTC') }}
+          Persistent=true
+          RandomizedDelaySec=300
+          [Install]
+          WantedBy=timers.target
+        dest: /etc/systemd/system/pg-ha-full-backup.timer
+        mode: '0644'
+      when: inventory_hostname == backup_repository_host
+    - name: Natively validate scheduled backup units
+      ansible.builtin.command:
+        argv: [systemd-analyze, verify, /etc/systemd/system/pg-ha-full-backup.service, /etc/systemd/system/pg-ha-full-backup.timer]
+      changed_when: false
+      when: inventory_hostname == backup_repository_host
+    - name: Enable daily backup timer
+      ansible.builtin.systemd_service:
+        name: pg-ha-full-backup.timer
+        daemon_reload: true
+        enabled: true
+        state: started
+      when: inventory_hostname == backup_repository_host

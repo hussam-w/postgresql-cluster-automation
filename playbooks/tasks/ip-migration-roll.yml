@@ -1,0 +1,125 @@
+---
+- name: Require all voters healthy before stopping one
+  ansible.builtin.command:
+    argv: ['{{ etcd_binary_dir }}/etcdctl', '--endpoints=https://{{ node.dns_name }}:{{ cluster.ports.etcd_client }}', --cacert=/etc/pg-ha/etcd/ca.pem, --cert=/etc/pg-ha/etcd/cert.pem, --key=/etc/pg-ha/etcd/key.pem, endpoint, health, --cluster]
+  changed_when: false
+- name: Read current local Patroni role
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:8008/patroni'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+  register: migrate_role
+- name: Select a currently synchronous streaming candidate from the actual primary
+  community.postgresql.postgresql_query:
+    login_unix_socket: /run/pg-ha-patroni
+    login_port: 5432
+    query: "SELECT application_name FROM pg_stat_replication WHERE state='streaming' AND sync_state='sync' AND pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) <= 1048576 ORDER BY application_name LIMIT 1"
+  become_user: postgres
+  register: migration_sync_candidate
+  when: migrate_role.json.role in ['master', 'primary']
+- name: Require a live synchronous candidate before switchover
+  ansible.builtin.assert:
+    that: migration_sync_candidate.query_result | length == 1
+  when: migrate_role.json.role in ['master', 'primary']
+- name: Controlled switchover before touching a current primary
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:8008/switchover'
+    method: POST
+    body_format: json
+    body:
+      leader: '{{ inventory_hostname }}'
+      candidate: '{{ migration_sync_candidate.query_result[0].application_name }}'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    url_username: operator
+    url_password: '{{ vault_patroni_api_password }}'
+    force_basic_auth: true
+    use_proxy: false
+    timeout: 90
+  no_log: true
+  register: migration_switchover
+  failed_when: false
+  when: migrate_role.json.role in ['master', 'primary']
+- name: Require successful controlled switchover response
+  ansible.builtin.assert:
+    that: migration_switchover.status | default(-1) == 200
+    fail_msg: "Switchover refused (HTTP {{ migration_switchover.status | default(-1) }}); preserve the current primary and diagnose candidate eligibility."
+  when: migrate_role.json.role in ['master', 'primary']
+- name: Require local demotion and catch-up before restarting
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:8008/replica?lag=1048576'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+  register: migrate_replica
+  retries: 60
+  delay: 2
+  until: migrate_replica.status == 200
+- name: Stage final configuration after primary demotion
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/pg-ha/ip-migration, final]
+  when: migration_phase == 'final'
+- name: Restart only this etcd voter with retained member data
+  ansible.builtin.systemd_service:
+    name: pg-ha-etcd
+    state: restarted
+- name: Require all voters healthy after rejoin
+  ansible.builtin.command:
+    argv: ['{{ etcd_binary_dir }}/etcdctl', '--endpoints=https://{{ node.dns_name }}:{{ cluster.ports.etcd_client }}', --cacert=/etc/pg-ha/etcd/ca.pem, --cert=/etc/pg-ha/etcd/cert.pem, --key=/etc/pg-ha/etcd/key.pem, endpoint, health, --cluster]
+  register: migrate_etcd
+  retries: 30
+  delay: 2
+  until: migrate_etcd.rc == 0
+  changed_when: false
+- name: Restart demoted replica authority and database
+  ansible.builtin.systemd_service:
+    name: pg-ha-patroni
+    state: restarted
+- name: Require streaming replica and healthy watchdog
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:8008/patroni'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+  register: migrated_patroni
+  retries: 90
+  delay: 2
+  until: migrated_patroni.status == 200 and migrated_patroni.json.state == 'running' and not (migrated_patroni.json.watchdog_failed | default(false))
+- name: Restart local pool and backup listener
+  ansible.builtin.systemd_service:
+    name: '{{ item }}'
+    state: restarted
+  loop: [pg-ha-pgbouncer, pg-ha-backup]
+- name: Apply final router configuration through graceful HAProxy reload
+  ansible.builtin.systemd_service:
+    name: pg-ha-haproxy
+    state: reloaded
+  when: migration_phase == 'final'
+- name: Apply overlapping VRRP peer identities for the rolling address move
+  ansible.builtin.systemd_service:
+    name: pg-ha-keepalived
+    state: restarted
+- name: Verify replica is caught up before continuing
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:8008/replica?lag=1048576'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+  register: migrate_caughtup
+  retries: 60
+  delay: 2
+  until: migrate_caughtup.status == 200
+- name: Verify router has role-aware usable backends
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/pg-ha/check-vip]
+  register: migrate_routing
+  retries: 30
+  delay: 2
+  until: migrate_routing.rc == 0
+  changed_when: false

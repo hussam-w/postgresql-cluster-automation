@@ -1,0 +1,16 @@
+---
+# Opt-in only: without this mapping, existing paths remain unchanged.
+# This is a TARGET server path, not the controller's HOME.
+storage_layout:
+  root: /srv/pg-storage
+  # Alternative for standalone: remove root and set home_user: dbadmin.
+  # getpwnam on each target resolves that account's home, then appends /data.
+
+# Derived paths (do not override these independently):
+# /srv/pg-storage/data             <- mounted data volume
+# /srv/pg-storage/data/pgdata      <- PostgreSQL PGDATA
+# /srv/pg-storage/wal/pg_wal       <- external WAL, native initdb/basebackup link
+# /srv/pg-storage/backups          <- backup volume on repository host (or standalone)
+# /srv/pg-storage/backups/repository
+# etcd storage remains separately configured; WAL is not an etcd directory.
+# Profile selection never formats, mounts, deletes, or relocates existing data.

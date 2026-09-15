@@ -1,0 +1,26 @@
+{
+  "stage": "discovery_only",
+  "bootstrap_approved": false,
+  "targets": {
+{% for host in groups['target_vms'] %}
+    {{ host | to_json }}: {
+      "management_ip": {{ hostvars[host].management_ip | to_json }},
+      "intended_roles": {{ hostvars[host].intended_roles | to_json }},
+      "observation_available": {{ (hostvars[host].discovery_observation.report is defined) | to_json }},
+      "report": {{ hostvars[host].discovery_observation.report | default(none) | to_nice_json }}
+    }{{ ',' if not loop.last else '' }}
+{% endfor %}
+  },
+  "missing_architecture_inputs": [
+    "explicit node/component topology and initial bootstrap authority",
+    "validated OS and component version policy",
+    "service addresses, DNS names, interfaces and VIP/network model",
+    "CPU/RAM/storage sizing and PostgreSQL/WAL/etcd directory decisions",
+    "replication durability, lag, timer and connection/pool budgets",
+    "TLS trust domains, certificates and application/service credentials",
+    "firewall and management-access policy",
+    "watchdog/fencing qualification",
+    "backup destination, retention, RPO/RTO and restore evidence",
+    "monitoring, change lock and representative failure-test evidence"
+  ]
+}

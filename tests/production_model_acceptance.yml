@@ -1,0 +1,21 @@
+---
+- name: Exercise the reference existing-cluster model with no extension-creation permission
+  ansible.builtin.import_playbook: ../playbooks/postgresql.yml
+  vars:
+    postgresql_deployment:
+      mode: cluster
+      major: '17'
+      topology:
+        primary: "{{ qa_primary | mandatory }}"
+        replicas: []
+        standby: "{{ qa_standby | mandatory }}"
+      extensions: []
+    postgresql_operation: configure
+    postgresql_allow_extension_create: false
+    postgresql_instance:
+      socket_dir: /run/pg-ha-patroni
+      port: 5432
+      expected_system_id: "{{ qa_protected_system_id | mandatory }}"
+    discovery_scan_roots: [/srv/postgres/data, /srv/etcd/data, /var/lib/postgresql, /var/lib/etcd]
+- name: Verify production HA health after model acceptance
+  ansible.builtin.import_playbook: ../playbooks/verify.yml

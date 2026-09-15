@@ -1,0 +1,70 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: export-verify
+
+- name: Verify the controller export using an independent database node
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Validate a distinct verifier and isolated export path
+      ansible.builtin.assert:
+        that:
+          - export_verify_host in groups['postgres_cluster']
+          - export_verify_host != backup_repository_host
+          - export_id is match('^[a-z0-9-]+$')
+          - export_controller_dir is match('^/home/[^/]+/\.local/share/pg-ha/exports$')
+      run_once: true
+    - name: Create a protected directory for ciphertext verification
+      ansible.builtin.file:
+        path: '/srv/postgres/export-verification-{{ export_id }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: inventory_hostname == export_verify_host
+    - name: Copy the actual controller export to the independent verifier
+      ansible.builtin.copy:
+        backup: true
+        src: '{{ export_controller_dir }}/{{ export_id }}.tar'
+        dest: '/srv/postgres/export-verification-{{ export_id }}/repository.tar'
+        owner: postgres
+        group: postgres
+        mode: '0600'
+      when: inventory_hostname == export_verify_host
+    - name: Create a separate repository extraction directory
+      ansible.builtin.file:
+        path: '/srv/postgres/export-verification-{{ export_id }}/repository'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      when: inventory_hostname == export_verify_host
+    - name: Extract only the project-generated encrypted archive
+      ansible.builtin.unarchive:
+        src: '/srv/postgres/export-verification-{{ export_id }}/repository.tar'
+        dest: '/srv/postgres/export-verification-{{ export_id }}/repository'
+        remote_src: true
+        owner: postgres
+        group: postgres
+      when: inventory_hostname == export_verify_host
+    - name: Independently decrypt and verify backup and WAL checksums locally
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', '--repo1-path=/srv/postgres/export-verification-{{ export_id }}/repository', --reset-repo1-host, --log-level-console=info, verify]
+      become_user: postgres
+      changed_when: false
+      register: exported_verification
+      when: inventory_hostname == export_verify_host
+    - name: Record the verifier result without credentials
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'archive': export_controller_dir ~ '/' ~ export_id ~ '.tar', 'verifier_host': export_verify_host, 'repository_host_contacted': false, 'verification': exported_verification.stdout, 'return_code': exported_verification.rc} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/export-verification.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      when: inventory_hostname == export_verify_host

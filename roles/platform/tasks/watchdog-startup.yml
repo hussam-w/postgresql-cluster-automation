@@ -1,0 +1,59 @@
+---
+- name: Create the protected startup helper directory
+  ansible.builtin.file:
+    path: /usr/local/libexec/pg-ha
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+- name: Persist explicit watchdog loading despite distribution module blacklists
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      [Unit]
+      Description=Provision the required PostgreSQL watchdog device
+      After=systemd-modules-load.service systemd-udev-trigger.service
+      Before=pg-ha-patroni.service
+      [Service]
+      Type=oneshot
+      ExecStart=/sbin/modprobe softdog
+      ExecStart=/usr/bin/udevadm settle --timeout=15
+      ExecStart=/usr/bin/test -c {{ cluster.watchdog_device }}
+      ExecStart=/usr/bin/chown postgres:postgres {{ cluster.watchdog_device }}
+      ExecStart=/usr/bin/chmod 0600 {{ cluster.watchdog_device }}
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/pg-ha-watchdog.service
+    owner: root
+    group: root
+    mode: '0644'
+- name: Install bounded time-synchronization readiness check
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      #!/usr/bin/python3
+      import subprocess
+      import sys
+      import time
+      deadline = time.monotonic() + 90
+      while time.monotonic() < deadline:
+          result = subprocess.run(['timedatectl', 'show', '--property=NTPSynchronized', '--value'], capture_output=True, text=True, timeout=5)
+          if result.returncode == 0 and result.stdout.strip() == 'yes':
+              sys.exit(0)
+          time.sleep(2)
+      sys.exit('Time synchronization was not established within 90 seconds')
+    dest: /usr/local/libexec/pg-ha/wait-clock
+    owner: root
+    group: root
+    mode: '0755'
+- name: Validate watchdog startup unit before activation
+  ansible.builtin.command:
+    argv: [systemd-analyze, verify, /etc/systemd/system/pg-ha-watchdog.service]
+  changed_when: false
+- name: Enable the explicit watchdog startup dependency without opening its device
+  ansible.builtin.systemd_service:
+    name: pg-ha-watchdog
+    enabled: true
+    daemon_reload: true
+    state: started

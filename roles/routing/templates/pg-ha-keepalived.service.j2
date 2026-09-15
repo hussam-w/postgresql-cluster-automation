@@ -1,0 +1,17 @@
+[Unit]
+Description=PostgreSQL routing VIP
+Wants=network-online.target pg-ha-haproxy.service
+After=network-online.target pg-ha-haproxy.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/keepalived --config-test -f /etc/pg-ha/keepalived.conf
+ExecStart=/usr/sbin/keepalived --dont-fork --log-console -f /etc/pg-ha/keepalived.conf
+ExecReload=/usr/sbin/keepalived --config-test -f /etc/pg-ha/keepalived.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

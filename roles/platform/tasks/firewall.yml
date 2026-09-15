@@ -1,0 +1,70 @@
+---
+- name: Read only the project's previous firewall table
+  ansible.builtin.command:
+    argv: [nft, list, table, inet, pg_ha]
+  changed_when: false
+  failed_when: previous_firewall.rc not in [0, 1]
+  register: previous_firewall
+
+- name: Preserve rollback transaction without affecting other firewall tables
+  ansible.builtin.copy:
+    backup: true
+    content: "{{ 'flush table inet pg_ha\n' ~ previous_firewall.stdout if previous_firewall.rc == 0 else 'delete table inet pg_ha\n' }}"
+    dest: /var/lib/pg-ha-platform/firewall.previous.nft
+    mode: '0600'
+
+- name: Stage and natively validate scoped firewall transaction
+  ansible.builtin.template:
+    backup: true
+    src: firewall.nft.j2
+    dest: /var/lib/pg-ha-platform/firewall.nft
+    mode: '0600'
+    validate: /usr/sbin/nft --check --file %s
+  register: firewall_candidate
+
+- name: Schedule firewall rollback before applying changed rules
+  ansible.builtin.command:
+    argv: [systemd-run, --unit=pg-ha-firewall-rollback, --on-active=120s, /usr/sbin/nft, --file, /var/lib/pg-ha-platform/firewall.previous.nft]
+  when: firewall_candidate.changed or previous_firewall.rc != 0
+
+- name: Atomically apply scoped firewall
+  ansible.builtin.command:
+    argv: [nft, --file, /var/lib/pg-ha-platform/firewall.nft]
+  when: firewall_candidate.changed or previous_firewall.rc != 0
+
+- name: Close multiplexed SSH connection to test a genuinely new connection
+  ansible.builtin.meta: reset_connection
+
+- name: Verify a fresh management connection through the firewall
+  ansible.builtin.wait_for_connection:
+    timeout: 45
+
+- name: Cancel firewall rollback after authenticated reconnect
+  ansible.builtin.systemd_service:
+    name: pg-ha-firewall-rollback.timer
+    state: stopped
+  when: firewall_candidate.changed or previous_firewall.rc != 0
+
+- name: Persist the isolated firewall without flushing unrelated rules
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      [Unit]
+      Description=PostgreSQL HA isolated ingress policy
+      Before=network-pre.target
+      Wants=network-pre.target
+      After=local-fs.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/sbin/nft --file /var/lib/pg-ha-platform/firewall.nft
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+    dest: /etc/systemd/system/pg-ha-firewall.service
+    mode: '0644'
+
+- name: Enable persistent firewall policy
+  ansible.builtin.systemd_service:
+    name: pg-ha-firewall.service
+    daemon_reload: true
+    enabled: true

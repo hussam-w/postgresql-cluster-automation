@@ -1,0 +1,61 @@
+---
+- name: Require explicit repository configuration admission
+  ansible.builtin.assert:
+    that: extension_allow_repository_changes | default(false) | bool
+  when: extension_repositories | default([]) | length > 0
+- name: Validate repository descriptors before changes
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-z][a-z0-9_-]*$')
+      - item.uri is match('^https://[a-zA-Z0-9./:_-]+$')
+      - item.suite is match('^[a-zA-Z0-9_-]+$')
+      - item.components is match('^[a-zA-Z0-9_ -]+$')
+      - item.key_sha256 is match('^[a-f0-9]{64}$')
+      - item.signed_by is match('^/usr/share/keyrings/[a-zA-Z0-9_.-]+$')
+  loop: '{{ extension_repositories | default([]) }}'
+- name: Inspect pre-provisioned repository trust keys
+  ansible.builtin.stat:
+    path: '{{ item.signed_by }}'
+    checksum_algorithm: sha256
+  loop: '{{ extension_repositories | default([]) }}'
+  register: extension_keys
+- name: Refuse missing or unsafe repository trust keys
+  ansible.builtin.assert:
+    that: item.stat.exists and item.stat.isreg and not item.stat.islnk and item.stat.uid == 0 and not item.stat.wgrp and not item.stat.woth and item.stat.roth and item.stat.checksum == item.item.key_sha256
+  loop: '{{ extension_keys.results }}'
+- name: Inspect repository files before replacement
+  ansible.builtin.stat:
+    path: '/etc/apt/sources.list.d/pg-ha-extension-{{ item.name }}.list'
+  loop: '{{ extension_repositories | default([]) }}'
+  register: extension_repo_files
+- name: Reject symlinked or unprotected repository files
+  ansible.builtin.assert:
+    that: not item.stat.exists or (item.stat.isreg and not item.stat.islnk and item.stat.uid == 0 and not item.stat.wgrp and not item.stat.woth)
+  loop: '{{ extension_repo_files.results }}'
+- name: Read existing repository ownership markers
+  ansible.builtin.slurp:
+    src: '{{ item.stat.path }}'
+  loop: '{{ extension_repo_files.results }}'
+  when: item.stat.exists
+  register: extension_repo_contents
+- name: Preserve foreign repository configuration
+  ansible.builtin.assert:
+    that: (item.content | b64decode).startswith('# Managed by pg-ha extension lifecycle\n')
+  loop: '{{ extension_repo_contents.results }}'
+  when: not item.skipped | default(false)
+- name: Write only approved repository definitions with backups
+  ansible.builtin.copy:
+    content: |
+      # Managed by pg-ha extension lifecycle
+      deb [signed-by={{ item.signed_by }}] {{ item.uri }} {{ item.suite }} {{ item.components }}
+    dest: '/etc/apt/sources.list.d/pg-ha-extension-{{ item.name }}.list'
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+  loop: '{{ extension_repositories | default([]) }}'
+  register: extension_repo_changes
+- name: Refresh metadata only after an approved repository change
+  ansible.builtin.apt:
+    update_cache: true
+  when: extension_repo_changes.changed

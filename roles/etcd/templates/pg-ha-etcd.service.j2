@@ -1,0 +1,25 @@
+[Unit]
+Description=Managed PostgreSQL HA etcd member
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor={{ cluster.etcd_data_dir }}
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+ExecStart={{ etcd_binary_dir }}/etcd --config-file=/etc/pg-ha/etcd/etcd.yml
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=120
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths={{ cluster.etcd_data_dir }}
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

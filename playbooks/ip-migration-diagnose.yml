@@ -1,0 +1,32 @@
+---
+- name: Diagnose post-migration VIP and network paths without modifying services
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read network, VRRP and role diagnostics
+      ansible.builtin.command:
+        argv: '{{ item }}'
+      loop:
+        - [ip, -4, address, show, dev, '{{ node.interface }}']
+        - [ip, route, show]
+        - [systemctl, is-active, pg-ha-keepalived, pg-ha-haproxy]
+        - [journalctl, -u, pg-ha-keepalived, -n, '35', --no-pager]
+        - [ss, -lnt]
+        - [/usr/local/libexec/pg-ha/check-vip]
+        - [cat, /etc/pg-ha/haproxy/haproxy.cfg]
+        - [nft, list, table, inet, pg_ha]
+        - [netplan, get]
+        - [python3, -c, "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/pg-ha-haproxy/admin.sock'); s.sendall(b'show stat\\n'); s.shutdown(socket.SHUT_WR); print(s.makefile().read())"]
+        - [curl, --silent, --show-error, --max-time, '5', --cacert, /etc/pg-ha/patroni/ca.pem, --cert, /etc/pg-ha/patroni/cert.pem, --key, /etc/pg-ha/patroni/key.pem, 'https://{{ node.dns_name }}:8008/cluster']
+      changed_when: false
+      register: migration_diagnostic
+      failed_when: false
+    - name: Record nonsecret diagnostics
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ migration_diagnostic.results | to_nice_json }}'
+        dest: '{{ playbook_dir }}/../artifacts/ip-migration-diagnostic-{{ inventory_hostname }}.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false

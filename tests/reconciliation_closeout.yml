@@ -1,0 +1,33 @@
+---
+- name: Verify production remains healthy after isolated qualification
+  ansible.builtin.import_playbook: ../playbooks/verify.yml
+
+- name: Confirm isolated test shutdown and clear only the failed test unit marker
+  hosts: "{{ qa_host | mandatory }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require all test ports to be closed
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: '{{ item }}'
+        state: stopped
+        timeout: 2
+      loop: [55491, 55492, 58008, 62379, 62380]
+    - name: Inspect the original failed test unit before clearing its status
+      ansible.builtin.command:
+        argv: [systemctl, show, pg-ha-reconcile-qa-patroni.service, '--property=ActiveState,MainPID,ExecStart,Transient,LoadState']
+      changed_when: false
+      failed_when: false
+      register: old_qa_unit
+    - name: Verify the failed unit is the stopped transient test fixture
+      ansible.builtin.assert:
+        that:
+          - "'MainPID=0' in old_qa_unit.stdout"
+          - "'Transient=yes' in old_qa_unit.stdout"
+          - "'/srv/postgres/reconcile-patroni-qa-20260913/patroni.yml' in old_qa_unit.stdout"
+      when: "'ActiveState=failed' in old_qa_unit.stdout"
+    - name: Clear only that test failure marker without starting any service
+      ansible.builtin.command:
+        argv: [systemctl, reset-failed, pg-ha-reconcile-qa-patroni.service]
+      when: "'ActiveState=failed' in old_qa_unit.stdout"

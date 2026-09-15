@@ -1,0 +1,69 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: final-acceptance
+
+- name: First independent read-only verification
+  ansible.builtin.import_playbook: verify.yml
+- name: Capture running service identities before repeat verification
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  roles: [common]
+  tasks:
+    - name: Capture service process and activation identities
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=MainPID, --property=ActiveEnterTimestampMonotonic, pg-ha-patroni, pg-ha-etcd, pg-ha-pgbouncer, pg-ha-haproxy, pg-ha-keepalived, pg-ha-backup]
+      changed_when: false
+      register: before_repeat_services
+- name: Second independent read-only verification
+  ansible.builtin.import_playbook: verify.yml
+- name: Record final nonsecret runtime evidence
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Capture service identities after repeat verification
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=MainPID, --property=ActiveEnterTimestampMonotonic, pg-ha-patroni, pg-ha-etcd, pg-ha-pgbouncer, pg-ha-haproxy, pg-ha-keepalived, pg-ha-backup]
+      changed_when: false
+      register: after_repeat_services
+    - name: Require unchanged processes and activation timestamps
+      ansible.builtin.assert:
+        that: before_repeat_services.stdout == after_repeat_services.stdout
+    - name: Verify current functional monitoring state
+      ansible.builtin.command:
+        argv: [/usr/local/libexec/pg-ha/health-monitor]
+      become_user: postgres
+      changed_when: false
+      register: final_monitor
+    - name: Record complete installed package manifest for auditability
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ ansible_facts.packages | to_nice_json }}'
+        dest: '{{ playbook_dir }}/../artifacts/{{ inventory_hostname }}-installed-packages.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+    - name: Build nonsecret node acceptance record
+      ansible.builtin.set_fact:
+        final_node:
+          name: '{{ inventory_hostname }}'
+          address: '{{ node.address }}'
+          role: '{{ local_role_health.json.role }}'
+          timeline: '{{ local_role_health.json.timeline }}'
+          owns_vip: '{{ owns_vip }}'
+          stable_services: true
+          monitor: '{{ final_monitor.stdout | from_json }}'
+    - name: Record final deployment state after every check passed
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'cluster': cluster.name, 'primary': current_primary, 'system_id': sql_state.query_result[0].system_identifier, 'vip': cluster.vip, 'dns_name': cluster.vip_dns_name, 'write_port': write_port, 'read_port': read_port, 'repeat_verification_passed': true, 'nodes': groups['postgres_cluster'] | map('extract', hostvars, 'final_node') | list} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/final-deployment.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      run_once: true

@@ -1,0 +1,63 @@
+---
+- name: Inspect installed package versions without updating repositories
+  ansible.builtin.package_facts:
+    manager: apt
+- name: Require exact pins and preserve every already-installed requested package
+  ansible.builtin.assert:
+    that:
+      - component_package_versions[item] is defined
+      - component_package_versions[item] is match('^[a-zA-Z0-9.+:~_-]+$')
+      - item not in ansible_facts.packages or ansible_facts.packages[item] | map(attribute='version') | list == [component_package_versions[item]]
+    fail_msg: 'Missing package pin or installed version conflict. Existing packages will not be upgraded/downgraded implicitly.'
+  loop: '{{ component_packages }}'
+- name: Determine missing packages
+  ansible.builtin.set_fact:
+    missing_component_packages: '{{ component_packages | difference(ansible_facts.packages.keys() | list) }}'
+- name: Require explicit installation permission when packages are missing
+  ansible.builtin.assert:
+    that: package_validation_only | default(false) or not missing_component_packages or postgresql_allow_package_install | default(false) | bool
+    fail_msg: 'Packages are missing. Review exact package pins and explicitly enable postgresql_allow_package_install.'
+- name: Simulate the complete package transaction before any installation
+  ansible.builtin.command:
+    argv: "{{ ['apt-get', '--simulate', '--no-remove', '--no-install-recommends', 'install'] + (component_packages | zip(component_packages | map('extract', component_package_versions)) | map('join', '=') | list) }}"
+  register: component_simulation
+  changed_when: false
+  when: missing_component_packages | length > 0
+- name: Refuse dependency upgrades removals and repair transactions
+  ansible.builtin.assert:
+    that:
+      - component_simulation.stdout is not regex('(?m)^Remv ')
+      - component_simulation.stdout is not regex('(?m)^Inst \S+ \[')
+      - component_simulation.stdout is not regex('(?m)^Conf \S+ \[')
+    fail_msg: 'Package resolution would alter existing dependencies. Coordinate separate package maintenance.'
+  when: missing_component_packages | length > 0
+- name: Install packaging support before suppressing automatic vendor cluster creation
+  environment:
+    NEEDRESTART_MODE: l
+  ansible.builtin.apt:
+    name: "postgresql-common={{ component_package_versions['postgresql-common'] }}"
+    state: present
+    policy_rc_d: 101
+    install_recommends: false
+    fail_on_autoremove: true
+    lock_timeout: 60
+  when: "not (package_validation_only | default(false)) and 'postgresql-common' in missing_component_packages"
+- name: Preserve vendor packaging policy and prevent an unwanted default cluster on fresh installation
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql-common/createcluster.conf
+    regexp: '^\s*#?\s*create_main_cluster\s*='
+    line: create_main_cluster = false
+    backup: true
+  when: "not (package_validation_only | default(false)) and ('postgresql-' ~ postgresql_deployment.major) in missing_component_packages"
+- name: Install only missing explicitly pinned components without service starts
+  environment:
+    NEEDRESTART_MODE: l
+  ansible.builtin.apt:
+    name: "{{ missing_component_packages | zip(missing_component_packages | map('extract', component_package_versions)) | map('join', '=') | list }}"
+    state: present
+    policy_rc_d: 101
+    install_recommends: false
+    allow_downgrade: false
+    fail_on_autoremove: true
+    lock_timeout: 60
+  when: missing_component_packages | length > 0 and not (package_validation_only | default(false))

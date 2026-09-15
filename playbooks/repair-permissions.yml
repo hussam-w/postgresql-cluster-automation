@@ -1,0 +1,29 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: repair-permissions
+
+- name: Repair nonsecret directory traversal in the recorded partial bootstrap
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require recorded bootstrap ownership
+      ansible.builtin.stat:
+        path: /var/lib/pg-ha-bootstrap.json
+      register: recorded_bootstrap
+    - name: Reject repair outside the managed bootstrap
+      ansible.builtin.assert:
+        that: recorded_bootstrap.stat.exists
+    - name: Permit service accounts to execute the root-owned integration helpers
+      ansible.builtin.file:
+        path: '{{ item }}'
+        owner: root
+        group: root
+        mode: '0755'
+        state: directory
+      loop: [/etc/pg-ha, /usr/local/libexec/pg-ha]
+- name: Resume the exact recorded bootstrap without recreating data
+  ansible.builtin.import_playbook: site.yml

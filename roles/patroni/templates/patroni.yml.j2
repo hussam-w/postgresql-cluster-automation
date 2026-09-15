@@ -1,0 +1,145 @@
+scope: {{ cluster.name | to_json }}
+namespace: /service/
+name: {{ inventory_hostname | to_json }}
+restapi:
+  listen: {{ (node.address ~ ':' ~ patroni_port) | to_json }}
+  connect_address: {{ (node.dns_name ~ ':' ~ patroni_port) | to_json }}
+  certfile: /etc/pg-ha/patroni/cert.pem
+  keyfile: /etc/pg-ha/patroni/key.pem
+  cafile: /etc/pg-ha/patroni/ca.pem
+  verify_client: required
+  authentication:
+    username: operator
+    password: {{ vault_patroni_api_password | to_json }}
+ctl:
+  certfile: /etc/pg-ha/patroni/cert.pem
+  keyfile: /etc/pg-ha/patroni/key.pem
+  cacert: /etc/pg-ha/patroni/ca.pem
+  insecure: false
+etcd3:
+  hosts:
+{% for host in groups['etcd_cluster'] %}
+    - {{ (hostvars[host].node.dns_name ~ ':' ~ etcd_client_port) | to_json }}
+{% endfor %}
+  protocol: https
+  cacert: /etc/pg-ha/dcs/ca.pem
+  cert: /etc/pg-ha/dcs/cert.pem
+  key: /etc/pg-ha/dcs/key.pem
+bootstrap:
+  dcs:
+    ttl: {{ cluster.replication.ttl }}
+    loop_wait: {{ cluster.replication.loop_wait }}
+    retry_timeout: {{ cluster.replication.retry_timeout }}
+    maximum_lag_on_failover: {{ cluster.replication.maximum_lag_on_failover }}
+    check_timeline: true
+    failsafe_mode: false
+    synchronous_mode: {{ (cluster.replication.mode == 'strict_sync') | to_json }}
+    synchronous_mode_strict: {{ (cluster.replication.mode == 'strict_sync') | to_json }}
+    synchronous_node_count: {{ cluster.replication.synchronous_node_count }}
+    postgresql:
+      use_pg_rewind: false
+      use_slots: true
+      parameters:
+        wal_level: replica
+        hot_standby: 'on'
+        synchronous_commit: 'on'
+        fsync: 'on'
+        full_page_writes: 'on'
+        wal_log_hints: 'on'
+        max_connections: {{ cluster.postgres.max_connections }}
+        superuser_reserved_connections: {{ cluster.postgres.superuser_reserved_connections }}
+        max_wal_senders: {{ cluster.replication.max_wal_senders }}
+        max_replication_slots: {{ cluster.replication.max_replication_slots }}
+        max_slot_wal_keep_size: {{ (cluster.replication.max_slot_wal_keep_size_mb ~ 'MB') | to_json }}
+        max_wal_size: {{ (cluster.postgres.max_wal_size_mb ~ 'MB') | to_json }}
+        archive_mode: {{ ('on' if wal_archive_enabled else 'off') | to_json }}
+        archive_timeout: {{ (cluster.backup.rpo_seconds if cluster.backup.rpo_seconds > 0 else 60) if wal_archive_enabled else 0 }}
+        archive_command: {{ postgres_archive_command | to_json }}
+{% if wal_archive_enabled %}
+      recovery_conf:
+        restore_command: {{ (cluster.backup.restore_executable ~ ' %f %p') | to_json }}
+{% endif %}
+  initdb:
+    - encoding: UTF8
+    - locale: {{ cluster.locale | to_json }}
+    - data-checksums
+    - auth-local: peer
+    - auth-host: scram-sha-256
+{% if cluster.wal_dir is defined %}
+    # Fresh initdb owns creation of the external WAL directory/link.
+    - waldir: {{ cluster.wal_dir | to_json }}
+{% endif %}
+postgresql:
+  listen: {{ (node.address ~ ',127.0.0.1:' ~ pg_port) | to_json }}
+  connect_address: {{ (node.dns_name ~ ':' ~ pg_port) | to_json }}
+  data_dir: {{ cluster.data_dir | to_json }}
+  bin_dir: {{ binary_dir | to_json }}
+  pgpass: /run/pg-ha-patroni/pgpass
+  use_unix_socket: true
+  use_unix_socket_repl: true
+  authentication:
+    superuser:
+      username: postgres
+      password: {{ vault_pg_superuser_password | to_json }}
+    replication:
+      username: replicator
+      password: {{ vault_pg_replication_password | to_json }}
+      sslmode: verify-full
+      sslrootcert: /etc/pg-ha/postgres/ca.pem
+  create_replica_methods: [basebackup]
+  basebackup:
+    checkpoint: spread
+{% if cluster.wal_dir is defined %}
+    # Keep replica WAL external while preserving the existing checkpoint policy.
+    waldir: {{ cluster.wal_dir | to_json }}
+{% endif %}
+  remove_data_directory_on_rewind_failure: false
+  remove_data_directory_on_diverged_timelines: false
+  parameters:
+    shared_buffers: {{ (cluster.postgres.shared_buffers_mb ~ 'MB') | to_json }}
+{% if postgresql_deployment is defined and hostvars.localhost.deployment_model.extensions.preload | length > 0 %}
+    shared_preload_libraries: {{ hostvars.localhost.deployment_model.extensions.preload | join(',') | to_json }}
+{% endif %}
+    password_encryption: scram-sha-256
+    ssl: 'on'
+    ssl_cert_file: /etc/pg-ha/postgres/cert.pem
+    ssl_key_file: /etc/pg-ha/postgres/key.pem
+    ssl_ca_file: /etc/pg-ha/postgres/ca.pem
+    ssl_min_protocol_version: TLSv1.2
+    unix_socket_directories: /run/pg-ha-patroni
+    log_connections: 'on'
+    log_disconnections: 'on'
+    log_statement: none
+  pg_hba:
+    - local all postgres peer
+    - local replication replicator scram-sha-256
+    - local all all reject
+{% for host in groups['postgres_cluster'] %}
+    - hostssl replication replicator {{ hostvars[host].node.address }}/32 scram-sha-256
+{% endfor %}
+{% for user in vault_app_users %}
+    - hostssl all {{ user.name }} {{ node.address }}/32 scram-sha-256
+{% endfor %}
+{% for cidr in cluster.admin_cidrs %}
+    - hostssl all postgres {{ cidr }} scram-sha-256
+{% endfor %}
+{% if not haproxy_enabled %}
+{% for user in vault_app_users %}
+{% for cidr in cluster.client_cidrs %}
+    - hostssl all {{ user.name }} {{ cidr }} scram-sha-256
+{% endfor %}
+{% endfor %}
+{% endif %}
+    - host all all 0.0.0.0/0 reject
+    - host replication all 0.0.0.0/0 reject
+    - host all all ::/0 reject
+    - host replication all ::/0 reject
+watchdog:
+  mode: required
+  device: {{ cluster.watchdog_device | to_json }}
+  safety_margin: -1
+tags:
+  nofailover: {{ (inventory_hostname in (postgresql_deployment | default({})).get('topology', {}).get('replicas', [])) | to_json }}
+  noloadbalance: false
+  clonefrom: false
+  nosync: {{ (inventory_hostname in (postgresql_deployment | default({})).get('topology', {}).get('replicas', [])) | to_json }}

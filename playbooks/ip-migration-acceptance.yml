@@ -1,0 +1,69 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: ip-migration-acceptance
+
+- name: Inspect the final actual-address network and SQL lineage
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect actual addresses
+      ansible.builtin.command:
+        argv: [ip, -j, -4, address, show]
+      changed_when: false
+      register: migrated_ip
+    - name: Inspect live service listeners
+      ansible.builtin.command:
+        argv: [ss, -H, -lnt]
+      changed_when: false
+      register: migrated_sockets
+    - name: Inspect persistent combined network
+      ansible.builtin.command:
+        argv: [netplan, get]
+      changed_when: false
+      register: migrated_netplan
+    - name: Require no retired service addresses in runtime or persistent network
+      ansible.builtin.assert:
+        that:
+          - node.address == ansible_host
+          - node.address in migrated_ip.stdout
+          - node.address in migrated_netplan.stdout
+    - name: Require every reviewed retired address to be absent
+      ansible.builtin.assert:
+        that: item.old not in migrated_ip.stdout ~ migrated_netplan.stdout ~ migrated_sockets.stdout
+      loop: '{{ migration_nodes.values() | list }}'
+    - name: Inspect peer source selection
+      ansible.builtin.command:
+        argv: [ip, -j, route, get, '{{ hostvars[item].node.address }}']
+      loop: '{{ groups.postgres_cluster | difference([inventory_hostname]) }}'
+      changed_when: false
+      register: migrated_routes
+      failed_when: (migrated_routes.stdout | from_json)[0].prefsrc != node.address
+    - name: Confirm the original PostgreSQL lineage remains intact
+      community.postgresql.postgresql_query:
+        login_unix_socket: /run/pg-ha-patroni
+        login_port: 5432
+        login_db: postgres
+        query: SELECT system_identifier::text FROM pg_control_system()
+      become_user: postgres
+      register: migrated_lineage
+      failed_when: migrated_lineage.query_result[0].system_identifier != migration_expected_system_id
+    - name: Write nonsecret address acceptance evidence
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'address': node.address, 'runtime': migrated_ip.stdout | from_json, 'listeners': migrated_sockets.stdout, 'netplan': migrated_netplan.stdout, 'system_identifier': migrated_lineage.query_result[0].system_identifier} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/ip-migration-final-{{ inventory_hostname }}.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+- name: Check actual application endpoint semantics
+  ansible.builtin.import_playbook: endpoints-verify.yml
+- name: Take and verify a backup after the network migration
+  ansible.builtin.import_playbook: backup-verify.yml
+- name: Prove isolated recovery after migration
+  ansible.builtin.import_playbook: restore-verify.yml
+- name: Run independent final health and unchanged-service verification
+  ansible.builtin.import_playbook: final-acceptance.yml

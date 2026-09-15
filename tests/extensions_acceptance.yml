@@ -1,0 +1,103 @@
+---
+- name: Qualify additive extension management on an isolated local-only instance
+  hosts: "{{ qa_host | mandatory }}"
+  gather_facts: false
+  become: true
+  vars:
+    qa_root: /srv/postgres/extensions-qa-20260913
+    qa_data: '{{ qa_root }}/data'
+    qa_socket: '{{ qa_root }}/socket'
+    qa_port: 55493
+  tasks:
+    - name: Require explicit isolated test intent
+      ansible.builtin.assert:
+        that: extension_test_confirmation | default('') == 'CREATE ISOLATED EXTENSION TEST'
+    - name: Inspect dedicated test directory
+      ansible.builtin.stat:
+        path: '{{ qa_root }}'
+      register: qa_existing
+    - name: Refuse reuse or reinitialization
+      ansible.builtin.assert:
+        that: not qa_existing.stat.exists
+    - name: Create only new private test directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      loop: ['{{ qa_root }}', '{{ qa_socket }}']
+    - name: Initialize only the newly admitted test path
+      ansible.builtin.command:
+        argv: [/usr/lib/postgresql/17/bin/initdb, '-D', '{{ qa_data }}', '--no-locale', '--auth=peer']
+        creates: '{{ qa_data }}/PG_VERSION'
+      become_user: postgres
+    - name: Exercise extension changes and guarantee shutdown
+      block:
+        - name: Start the private socket-only test instance
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_ctl, '-D', '{{ qa_data }}', '-l', '{{ qa_root }}/server.log', '-o', "-c listen_addresses='' -c unix_socket_directories={{ qa_socket }} -p {{ qa_port }} -c shared_buffers=32MB", '-w', start]
+          become_user: postgres
+        - name: Plan optional crypto extension
+          postgres_extensions:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            major: '17'
+            optional: [pgcrypto]
+          register: qa_plan
+        - name: Add exactly the reviewed extension
+          postgres_extensions:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            major: '17'
+            optional: [pgcrypto]
+            operation: apply
+            allow_create: true
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+            expected_plan_sha256: '{{ qa_plan.report.plan_sha256 }}'
+          register: qa_apply
+        - name: Repeat the satisfied extension request
+          postgres_extensions:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            major: '17'
+            optional: [pgcrypto]
+            operation: apply
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+          register: qa_repeat
+        - name: Plan missing preload without changing configuration
+          postgres_extensions:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            major: '17'
+            optional: [pg_stat_statements]
+          register: qa_preload
+        - name: Create private unsafe-schema fixture
+          ansible.builtin.command:
+            argv: [psql, '-X', '-h', '{{ qa_socket }}', '-p', '{{ qa_port | string }}', '-d', template1, '-v', ON_ERROR_STOP=1, '-c', 'CREATE ROLE untrusted; CREATE SCHEMA unsafe AUTHORIZATION untrusted; REVOKE CREATE ON SCHEMA unsafe FROM untrusted;']
+          become_user: postgres
+        - name: Detect unsafe ownership even without CREATE privileges
+          postgres_extensions:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            major: '17'
+            optional: [pgcrypto]
+            databases: [template1]
+            schema: unsafe
+          register: qa_unsafe
+        - name: Prove addition repeat preservation preload refusal and unchanged server identity
+          ansible.builtin.assert:
+            that:
+              - qa_plan.would_change and qa_apply.changed
+              - not qa_repeat.changed
+              - qa_repeat.report.databases.postgres.available.pgcrypto.installed_version != None
+              - qa_repeat.report.identity.started == qa_plan.report.identity.started
+              - qa_preload.report.blockers | length > 0
+              - qa_unsafe.report.blockers | length > 0
+      always:
+        - name: Stop only the test server and retain evidence
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_ctl, '-D', '{{ qa_data }}', '-m', fast, '-w', stop]
+          become_user: postgres
+          register: qa_stop
+          failed_when: qa_stop.rc != 0 and 'no server running' not in qa_stop.stderr

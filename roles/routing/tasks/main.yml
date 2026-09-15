@@ -1,0 +1,78 @@
+---
+- name: Record routing behavior for explicitly selected modular membership
+  ansible.builtin.copy:
+    content: "{{ {'require_replicas': groups['postgres_cluster'] | length > 1} | to_nice_json }}"
+    dest: /etc/pg-ha/routing.json
+    owner: root
+    group: root
+    mode: '0600'
+    backup: true
+  when: cluster.get('architecture') == 'modular'
+
+- name: Install fail-closed VIP health check
+  ansible.builtin.copy:
+    backup: true
+    src: check_vip.py
+    dest: /usr/local/libexec/pg-ha/check-vip
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Validate HAProxy routing before activation
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/pg-ha/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: '0600'
+    backup: true
+    validate: /usr/sbin/haproxy -c -f %s
+
+- name: Validate Keepalived candidate
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/pg-ha/keepalived.conf
+    owner: root
+    group: root
+    mode: '0600'
+    backup: true
+    validate: /usr/sbin/keepalived --config-test -f %s
+
+- name: Install routing units
+  ansible.builtin.template:
+    backup: true
+    src: "{{ item }}.service.j2"
+    dest: "/etc/systemd/system/{{ item }}.service"
+    owner: root
+    group: root
+    mode: '0644'
+  loop: [pg-ha-haproxy, pg-ha-keepalived]
+
+- name: Validate routing systemd units before activation
+  ansible.builtin.command:
+    argv: [/usr/bin/systemd-analyze, verify, /etc/systemd/system/pg-ha-haproxy.service, /etc/systemd/system/pg-ha-keepalived.service]
+  changed_when: false
+
+- name: Activate HAProxy
+  ansible.builtin.systemd_service:
+    name: pg-ha-haproxy
+    daemon_reload: true
+    state: started
+    enabled: true
+
+- name: Require usable role-aware backends before allowing VIP ownership
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/pg-ha/check-vip]
+  changed_when: false
+  register: routing_ready
+  retries: 30
+  delay: 2
+  until: routing_ready.rc == 0
+  # Socket CSV inspection checks routing decisions, not process existence.
+
+- name: Start Keepalived only after the routing gate succeeds
+  ansible.builtin.systemd_service:
+    name: pg-ha-keepalived
+    daemon_reload: true
+    state: started
+    enabled: true

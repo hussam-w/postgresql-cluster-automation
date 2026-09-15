@@ -1,0 +1,21 @@
+# Owned only for this explicitly provisioned standalone instance.
+listen_addresses = '{{ standalone.listen_address }}'
+port = {{ standalone.port }}
+unix_socket_directories = '/run/pg-standalone-{{ standalone.name }}'
+password_encryption = 'scram-sha-256'
+shared_buffers = '{{ standalone.shared_buffers_mb }}MB'
+max_connections = {{ standalone.max_connections }}
+fsync = on
+full_page_writes = on
+synchronous_commit = on
+wal_level = minimal
+max_wal_senders = 0
+archive_mode = off
+shared_preload_libraries = '{{ hostvars.localhost.deployment_model.extensions.preload | join(",") }}'
+{% if standalone.listen_address %}
+ssl = on
+ssl_min_protocol_version = 'TLSv1.2'
+ssl_cert_file = '{{ standalone.tls.cert }}'
+ssl_key_file = '{{ standalone.tls.key }}'
+ssl_ca_file = '{{ standalone.tls.ca }}'
+{% endif %}

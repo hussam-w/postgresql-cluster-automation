@@ -1,0 +1,21 @@
+[Unit]
+Description=PostgreSQL role-aware HAProxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=/usr/sbin/haproxy -c -f /etc/pg-ha/haproxy/haproxy.cfg
+ExecStart=/usr/sbin/haproxy -Ws -f /etc/pg-ha/haproxy/haproxy.cfg -p /run/pg-ha-haproxy/haproxy.pid
+ExecReload=/usr/sbin/haproxy -c -f /etc/pg-ha/haproxy/haproxy.cfg
+ExecReload=/bin/kill -USR2 $MAINPID
+RuntimeDirectory=pg-ha-haproxy
+Restart=on-failure
+RestartSec=5
+LimitNOFILE={{ cluster.pool.max_client_conn * 2 + 2048 }}
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

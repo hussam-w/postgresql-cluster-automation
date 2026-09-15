@@ -1,0 +1,34 @@
+---
+# Inventory: one pg1 host in postgres_cluster; empty etcd_cluster and routers.
+postgresql_version: '17'
+enable_backup: false
+enable_haproxy: false
+backup_target_path: null
+backup_schedule: '*-*-* 02:15:00 UTC'
+postgresql_extensions: []
+postgresql_extension_registry: {}
+postgresql_deployment:
+  mode: standalone
+  major: '{{ postgresql_version }}'
+  topology: {primary: pg1, replicas: [], standby: [], replica_count: 0, standby_count: 0}
+  components:
+    backup: '{{ enable_backup }}'
+    haproxy: '{{ enable_haproxy }}'
+  extensions: '{{ postgresql_extensions }}'
+  extension_registry: '{{ postgresql_extension_registry }}'
+  extension_databases: [postgres]
+postgresql_operation: plan
+standalone:
+  name: main
+  data_dir: /srv/postgresql/data
+  storage_mount: /srv/postgresql
+  port: 5432
+  listen_address: '' # Local socket by default. TCP requires TLS and approved CIDRs.
+  client_cidrs: []
+  shared_buffers_mb: 128
+  max_connections: 100
+  min_free_bytes: 10737418240
+  locale: C.UTF-8
+postgresql_package_versions: {} # Fill exact pins for selected major and extensions.
+postgresql_allow_package_install: false
+postgresql_allow_extension_create: false

@@ -1,0 +1,64 @@
+---
+- name: Render and validate etcd candidate
+  ansible.builtin.template:
+    src: etcd.yml.j2
+    dest: /etc/pg-ha/etcd/etcd.yml
+    owner: etcd
+    group: etcd
+    mode: '0600'
+    backup: true
+    validate: /usr/local/libexec/pg-ha/validate-config etcd %s
+
+- name: Install etcd unit
+  ansible.builtin.template:
+    backup: true
+    src: pg-ha-etcd.service.j2
+    dest: /etc/systemd/system/pg-ha-etcd.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Validate the etcd systemd unit before activation
+  ansible.builtin.command:
+    argv: [/usr/bin/systemd-analyze, verify, /etc/systemd/system/pg-ha-etcd.service]
+  changed_when: false
+  # systemd has no Ansible-native unit parser; validate before first activation.
+
+- name: Activate all initial etcd members without a serial quorum deadlock
+  ansible.builtin.systemd_service:
+    name: pg-ha-etcd
+    daemon_reload: true
+    enabled: true
+    state: started
+    no_block: true
+
+- name: Require authenticated health on every initial etcd endpoint
+  ansible.builtin.command:
+    argv: ['{{ etcd_binary_dir }}/etcdctl', endpoint, health, --write-out=json]
+  environment:
+    ETCDCTL_API: '3'
+    ETCDCTL_ENDPOINTS: "https://{{ node.dns_name }}:{{ etcd_client_port }}"
+    ETCDCTL_CACERT: /etc/pg-ha/etcd/ca.pem
+    ETCDCTL_CERT: /etc/pg-ha/etcd/cert.pem
+    ETCDCTL_KEY: /etc/pg-ha/etcd/key.pem
+  register: etcd_health
+  changed_when: false
+  retries: 30
+  delay: 2
+  until: etcd_health.rc == 0
+  # etcdctl checks consensus-backed endpoint health; TCP reachability is insufficient.
+
+- name: Check that the Patroni DCS namespace is empty before PostgreSQL bootstrap
+  ansible.builtin.command:
+    argv: ['{{ etcd_binary_dir }}/etcdctl', get, "/service/{{ cluster.name }}/", --prefix, --keys-only]
+  environment:
+    ETCDCTL_API: '3'
+    ETCDCTL_ENDPOINTS: "https://{{ node.dns_name }}:{{ etcd_client_port }}"
+    ETCDCTL_CACERT: /etc/pg-ha/etcd/ca.pem
+    ETCDCTL_CERT: /etc/pg-ha/etcd/cert.pem
+    ETCDCTL_KEY: /etc/pg-ha/etcd/key.pem
+  register: namespace_check
+  changed_when: false
+  failed_when: namespace_check.rc != 0 or namespace_check.stdout | trim | length > 0
+
+  when: deployment_mode == 'bootstrap'

@@ -1,0 +1,24 @@
+[Unit]
+Description=Node-local PgBouncer
+Wants=network-online.target
+After=network-online.target pg-ha-patroni.service
+
+[Service]
+Type=simple
+User=pgbouncer
+Group=pgbouncer
+ExecStart=/usr/sbin/pgbouncer /etc/pg-ha/pgbouncer/pgbouncer.ini
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=pg-ha-pgbouncer
+RuntimeDirectoryMode=0750
+UMask=0077
+LimitNOFILE={{ cluster.pool.max_client_conn + cluster.postgres.max_connections + 1024 }}
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

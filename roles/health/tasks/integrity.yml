@@ -1,0 +1,72 @@
+---
+- name: Enumerate managed configuration and executable metadata
+  ansible.builtin.set_fact:
+    managed_files: "{{ ['/etc/pg-ha/patroni/patroni.yml', '/etc/pg-ha/pgbouncer/pgbouncer.ini', '/etc/pg-ha/pgbouncer/userlist.txt', '/etc/systemd/system/pg-ha-patroni.service', '/etc/systemd/system/pg-ha-pgbouncer.service', '/usr/local/libexec/pg-ha/validate-config'] + (['/etc/pg-ha/etcd/etcd.yml', '/etc/systemd/system/pg-ha-etcd.service'] if inventory_hostname in groups['etcd_cluster'] else []) + (['/etc/pg-ha/haproxy/haproxy.cfg', '/etc/pg-ha/keepalived.conf', '/etc/systemd/system/pg-ha-haproxy.service', '/etc/systemd/system/pg-ha-keepalived.service', '/usr/local/libexec/pg-ha/check-vip'] if haproxy_enabled and inventory_hostname in groups['routers'] else []) }}"
+
+- name: Include the actual HAProxy client credential bundle in integrity checks
+  ansible.builtin.set_fact:
+    managed_files: "{{ managed_files + ['/etc/pg-ha/haproxy/client.pem'] }}"
+  when: inventory_hostname in groups['routers']
+
+- name: Include modular routing policy in managed integrity
+  ansible.builtin.set_fact:
+    managed_files: "{{ managed_files + ['/etc/pg-ha/routing.json'] }}"
+  when: cluster.get('architecture') == 'modular' and haproxy_enabled and inventory_hostname in groups['routers']
+
+- name: Include private TLS files in drift detection without reading their contents into results
+  ansible.builtin.set_fact:
+    managed_files: "{{ managed_files + ['/etc/pg-ha/' ~ item.0 ~ '/' ~ item.1 ~ '.pem'] }}"
+  loop: "{{ (['postgres', 'patroni', 'dcs', 'pgbouncer'] + (['etcd'] if inventory_hostname in groups['etcd_cluster'] else []) + (['haproxy'] if haproxy_enabled and inventory_hostname in groups['routers'] else [])) | product(['ca', 'cert', 'key']) | list }}"
+
+- name: Read managed file checksums and permissions without exposing content
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop: "{{ managed_files }}"
+  register: managed_stats
+
+- name: Require real files with safe ownership and permissions
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - not item.stat.wgrp
+      - not item.stat.woth
+  loop: "{{ managed_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Build immutable file fingerprint
+  ansible.builtin.set_fact:
+    managed_fingerprint: {}
+
+- name: Record content, ownership and mode in the fingerprint
+  ansible.builtin.set_fact:
+    managed_fingerprint: "{{ managed_fingerprint | combine({item.item: {'sha256': item.stat.checksum, 'uid': item.stat.uid, 'gid': item.stat.gid, 'mode': item.stat.mode}}) }}"
+  loop: "{{ managed_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read recorded file fingerprint
+  ansible.builtin.slurp:
+    src: /var/lib/pg-ha/files.json
+  register: recorded_fingerprint
+  when: deployment_mode == 'verify'
+
+- name: Reject unreviewed configuration drift
+  ansible.builtin.assert:
+    that: recorded_fingerprint.content | b64decode | from_json == managed_fingerprint
+    fail_msg: 'Configuration fingerprint differs. Investigate the change; do not overwrite the fingerprint to bypass review.'
+  when: deployment_mode == 'verify'
+
+- name: Record the initial file fingerprint
+  ansible.builtin.copy:
+    backup: true
+    content: "{{ managed_fingerprint | to_nice_json }}"
+    dest: /var/lib/pg-ha/files.json
+    owner: root
+    group: root
+    mode: '0600'
+  when: deployment_mode in ['bootstrap', 'resume']

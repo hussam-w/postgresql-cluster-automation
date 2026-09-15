@@ -1,0 +1,252 @@
+---
+- name: Validate the architecture contract before host access
+  ansible.builtin.import_playbook: model-validate.yml
+- name: Discover infrastructure and existing database resources
+  ansible.builtin.import_playbook: inspect.yml
+
+- name: Resolve explicitly selected storage layout before provisioning admission
+  ansible.builtin.import_playbook: storage-resolve.yml
+
+- name: Admit the selected model without changing existing roles
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require consistent model and supported operating system for writes
+      ansible.builtin.assert:
+        that:
+          - postgresql_deployment == hostvars.localhost.deployment_model_input
+          - postgresql_operation | default('plan') == 'plan' or not reconciliation_blocked
+          - postgresql_operation | default('plan') == 'plan' or (ansible_distribution == 'Ubuntu' and ansible_distribution_version == '22.04')
+    - name: Inspect completed HA ownership before choosing provisioning or verification
+      ansible.builtin.stat:
+        path: /var/lib/pg-ha/identity.json
+      register: model_owned_ha
+    - name: Refuse partially owned HA topologies and inconsistent HA bootstrap policy
+      ansible.builtin.assert:
+        that:
+          - owned_count | int in [0, groups['postgres_cluster'] | length]
+          - cluster.bootstrap_host == hostvars.localhost.deployment_model.initial_primary
+          - cluster.replication.mode != 'strict_sync' or cluster.replication.synchronous_node_count <= postgresql_deployment.topology.standby | length
+        fail_msg: 'HA topology is partially owned or conflicts with the bootstrap/synchronous policy. Plan a controlled migration.'
+      vars:
+        owned_count: "{{ groups['postgres_cluster'] | map('extract', hostvars, 'model_owned_ha') | selectattr('stat.exists') | list | length }}"
+      when: postgresql_deployment.mode == 'cluster'
+    - name: Record whether this is a completed managed HA deployment
+      ansible.builtin.set_fact:
+        model_ha_existing: '{{ model_owned_ha.stat.exists }}'
+    - name: Retain the uniform HA ownership decision for controller-side imported gates
+      ansible.builtin.set_fact:
+        model_ha_existing: '{{ model_owned_ha.stat.exists }}'
+      delegate_to: localhost
+      delegate_facts: true
+      run_once: true
+    - name: Configure explicitly approved extension sources before fresh package resolution
+      ansible.builtin.include_role:
+        name: extension_repositories
+      when: postgresql_operation | default('plan') == 'provision' and extension_repositories | default([]) | length > 0
+    - name: Prevalidate selected extension package resolution before fresh deployment
+      ansible.builtin.include_role:
+        name: packages_safe
+      vars:
+        component_packages: '{{ hostvars.localhost.deployment_model.extensions.packages }}'
+        component_package_versions: "{{ (cluster | default({})).get('packages', {}) | combine(postgresql_package_versions | default({})) }}"
+        package_validation_only: true
+      when: postgresql_operation | default('plan') == 'provision'
+    - name: Admit optional mounted layout before any fresh provisioning changes
+      ansible.builtin.include_role:
+        name: storage_guard
+      when: postgresql_operation | default('plan') == 'provision'
+
+- name: Provision standalone PostgreSQL without HA roles
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: standalone
+      when: postgresql_deployment.mode == 'standalone' and postgresql_operation | default('plan') == 'provision'
+
+- name: Provision new HA through the established guarded implementation
+  ansible.builtin.import_playbook: provision-cluster.yml
+  when: postgresql_deployment.mode == 'cluster' and postgresql_operation | default('plan') == 'provision' and not (model_ha_existing | default(false))
+
+- name: Verify completed HA rather than replaying bootstrap
+  ansible.builtin.import_playbook: verify.yml
+  when: postgresql_deployment.mode == 'cluster' and postgresql_operation | default('plan') == 'provision' and model_ha_existing | default(false)
+
+- name: Observe selected extension state and role eligibility on every host
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Resolve the explicit existing or managed local endpoint
+      ansible.builtin.set_fact:
+        model_instance: "{{ {'socket_dir': ('/run/pg-ha-patroni' if postgresql_deployment.mode == 'cluster' else '/run/pg-standalone-' ~ (standalone | default({})).get('name', 'main')), 'port': (standalone | default({})).get('port', (cluster | default({})).get('ports', {}).get('postgres', 5432)), 'owner': 'postgres'} | combine(postgresql_instance | default({})) }}"
+    - name: Inspect the selected socket without starting a service
+      ansible.builtin.stat:
+        path: '{{ model_instance.socket_dir }}/.s.PGSQL.{{ model_instance.port }}'
+      register: model_socket
+    - name: Inspect selected extension availability installed versions and preload requirements
+      postgres_extensions:
+        socket_dir: '{{ model_instance.socket_dir }}'
+        port: '{{ model_instance.port }}'
+        owner: '{{ model_instance.owner }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+      register: model_extensions
+      when: model_socket.stat.exists
+    - name: Inspect existing Patroni eligibility without exposing configuration secrets
+      postgres_role_info:
+        path: '{{ model_instance.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}'
+      register: model_role
+      when: postgresql_deployment.mode == 'cluster' and model_socket.stat.exists
+    - name: Report role and extension plan with explicit intervention conditions
+      ansible.builtin.debug:
+        msg:
+          intended_role: '{{ hostvars.localhost.deployment_model.roles[inventory_hostname] }}'
+          socket_present: '{{ model_socket.stat.exists }}'
+          extensions: '{{ model_extensions.report | default("No running target; provision a new instance or supply its existing socket") }}'
+          observed_patroni_role_policy: '{{ model_role | default({}) }}'
+    - name: Refuse unavailable targets incompatible extensions or automatic role reassignment
+      ansible.builtin.assert:
+        that:
+          - model_socket.stat.exists
+          - model_extensions.report.blockers | length == 0
+          - postgresql_deployment.mode != 'cluster' or model_role.exists
+          - postgresql_deployment.mode != 'cluster' or model_role.nofailover == (hostvars.localhost.deployment_model.roles[inventory_hostname] == 'replica')
+          - postgresql_deployment.mode != 'cluster' or model_role.nosync == (hostvars.localhost.deployment_model.roles[inventory_hostname] == 'replica')
+        fail_msg: 'Target, extensions or node-role policy require intervention. Existing configuration/preloads/roles are preserved; no restart or promotion is performed.'
+      when: postgresql_operation | default('plan') in ['configure', 'provision']
+    - name: Require common HA lineage and exactly one eligible runtime primary
+      ansible.builtin.assert:
+        that:
+          - groups['postgres_cluster'] | map('extract', hostvars, 'model_extensions') | map(attribute='report.identity.system_id') | unique | length == 1
+          - groups['postgres_cluster'] | map('extract', hostvars, 'model_extensions') | rejectattr('report.identity.recovery') | list | length == 1
+          - model_extensions.report.identity.recovery or hostvars.localhost.deployment_model.roles[inventory_hostname] != 'replica'
+      when: postgresql_deployment.mode == 'cluster' and postgresql_operation | default('plan') in ['configure', 'provision']
+    - name: Admit each extension plan before any database receives DDL
+      ansible.builtin.assert:
+        that:
+          - not model_extensions.would_change or postgresql_allow_extension_create | default(false) | bool
+          - postgresql_operation == 'provision' or model_instance.expected_system_id | default('') == model_extensions.report.identity.system_id
+          - not model_extensions.would_change or model_extensions.report.identity.recovery or postgresql_operation == 'provision' or postgresql_extension_plan_sha256 | default('') == model_extensions.report.plan_sha256
+        fail_msg: 'Review the extension plan and enable explicit creation with the correct identity and plan hash.'
+      when: postgresql_operation | default('plan') in ['configure', 'provision']
+
+- name: Install optional packages only under explicit package-maintenance intent
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require a detected matching server before existing-instance package changes
+      ansible.builtin.assert:
+        that:
+          - model_socket.stat.exists
+          - model_extensions.report.identity.major | string == postgresql_deployment.major
+      when: postgresql_operation | default('plan') == 'packages'
+    - name: Install only the selected version-specific packages
+      ansible.builtin.include_role:
+        name: packages_safe
+      vars:
+        component_packages: '{{ hostvars.localhost.deployment_model.extensions.packages }}'
+        component_package_versions: "{{ (cluster | default({})).get('packages', {}) | combine(postgresql_package_versions | default({})) }}"
+      when: postgresql_operation | default('plan') == 'packages'
+
+- name: Add extensions only on the actual writable database
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Apply only the already-admitted additive extension plan
+      postgres_extensions:
+        socket_dir: '{{ model_instance.socket_dir }}'
+        port: '{{ model_instance.port }}'
+        owner: '{{ model_instance.owner }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+        expected_system_id: '{{ model_extensions.report.identity.system_id }}'
+        expected_plan_sha256: '{{ model_extensions.report.plan_sha256 }}'
+        allow_create: '{{ postgresql_allow_extension_create | default(false) }}'
+        operation: apply
+      when: postgresql_operation | default('plan') in ['configure', 'provision'] and not model_extensions.report.identity.recovery
+    - name: Verify extension presence on every selected database and replica
+      postgres_extensions:
+        socket_dir: '{{ model_instance.socket_dir }}'
+        port: '{{ model_instance.port }}'
+        owner: '{{ model_instance.owner }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+      register: model_extension_after
+      until: not model_extension_after.would_change and model_extension_after.report.blockers | length == 0
+      retries: 15
+      delay: 2
+      when: postgresql_operation | default('plan') in ['configure', 'provision']
+
+- name: Apply explicitly selected backup components and report connection strategy
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Admit existing-instance component maintenance against its exact identity
+      ansible.builtin.assert:
+        that:
+          - model_socket.stat.exists
+          - model_extensions.report.identity.major | string == postgresql_deployment.major
+          - model_instance.expected_system_id | default('') == model_extensions.report.identity.system_id
+      when: postgresql_operation | default('plan') == 'components'
+    - name: Install logical backup automation only when selected
+      ansible.builtin.include_role:
+        name: logical_backup
+      when: hostvars.localhost.deployment_model.components.backup and postgresql_operation | default('plan') in ['provision', 'components']
+    - name: Observe an existing managed backup configuration when disabling scheduling
+      ansible.builtin.stat:
+        path: '/etc/pg-ha-logical-backup/{{ component_name }}.json'
+      vars:
+        component_name: "{{ cluster.name if postgresql_deployment.mode == 'cluster' else (standalone | default({})).get('name', 'main') }}"
+      register: component_backup_marker
+      when: not hostvars.localhost.deployment_model.components.backup and postgresql_operation | default('plan') == 'components'
+    - name: Require protected ownership before disabling a managed timer
+      ansible.builtin.assert:
+        that: component_backup_marker.stat.isreg and component_backup_marker.stat.uid == 0 and not component_backup_marker.stat.wgrp and not component_backup_marker.stat.woth
+      when: not hostvars.localhost.deployment_model.components.backup and postgresql_operation | default('plan') == 'components' and component_backup_marker.stat.exists
+    - name: Read the existing backup cluster identity before disabling scheduling
+      ansible.builtin.slurp:
+        src: '/etc/pg-ha-logical-backup/{{ component_name }}.json'
+      vars:
+        component_name: "{{ cluster.name if postgresql_deployment.mode == 'cluster' else (standalone | default({})).get('name', 'main') }}"
+      register: component_backup_previous
+      when: not hostvars.localhost.deployment_model.components.backup and postgresql_operation | default('plan') == 'components' and component_backup_marker.stat.exists
+    - name: Verify the backup belongs to the observed cluster before disabling it
+      ansible.builtin.assert:
+        that: (component_backup_previous.content | b64decode | from_json).system_id == model_extensions.report.identity.system_id
+      when: not hostvars.localhost.deployment_model.components.backup and postgresql_operation | default('plan') == 'components' and component_backup_marker.stat.exists
+    - name: Stop only future managed backup scheduling
+      ansible.builtin.systemd_service:
+        name: 'pg-ha-logical-backup-{{ component_name }}.timer'
+        enabled: false
+        state: stopped
+      vars:
+        component_name: "{{ cluster.name if postgresql_deployment.mode == 'cluster' else (standalone | default({})).get('name', 'main') }}"
+      when: not hostvars.localhost.deployment_model.components.backup and postgresql_operation | default('plan') == 'components' and component_backup_marker.stat.exists
+    - name: Report intended component state and direct connection requirements
+      ansible.builtin.debug:
+        msg:
+          components: '{{ hostvars.localhost.deployment_model.components }}'
+          automatic_database_failover: '{{ hostvars.localhost.deployment_model.automatic_failover_available }}'
+          routing: "{{ 'VIP through HAProxy' if hostvars.localhost.deployment_model.components.haproxy else 'Direct node endpoints; cluster clients must use multi-host connections with target_session_attrs=read-write/read-only and reconnect on failure' }}"
+          note: 'Plan reports desired state only. Existing HAProxy/VIP removal and topology changes require separate controlled migration.'

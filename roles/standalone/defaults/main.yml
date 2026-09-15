@@ -1,0 +1,14 @@
+---
+standalone_defaults:
+  name: main
+  # Legacy path, retained unless the explicit storage_layout profile is selected.
+  # storage_layout derives data/pgdata and wal/pg_wal beneath one target root.
+  data_dir: /srv/postgresql/data
+  storage_mount: null
+  port: 5432
+  listen_address: ''
+  client_cidrs: []
+  shared_buffers_mb: 128
+  max_connections: 100
+  min_free_bytes: 10737418240
+  locale: C.UTF-8

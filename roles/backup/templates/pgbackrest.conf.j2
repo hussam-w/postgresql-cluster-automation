@@ -1,0 +1,47 @@
+[global]
+repo1-path={{ backup_repository_path }}
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass={{ vault_backup_cipher_pass }}
+repo1-retention-full=2
+process-max=2
+compress-type=zst
+log-level-console=warn
+log-level-file=info
+log-path=/var/log/pgbackrest
+lock-path=/var/lib/pgbackrest/lock
+spool-path=/var/lib/pgbackrest/spool
+archive-timeout=120
+tls-server-address={{ node.address }}
+tls-server-port={{ backup_port }}
+tls-server-ca-file=/etc/pgbackrest/ca.pem
+tls-server-cert-file=/etc/pgbackrest/cert.pem
+tls-server-key-file=/etc/pgbackrest/key.pem
+{% for host in groups['postgres_cluster'] %}
+tls-server-auth={{ host }}={{ cluster.name }}
+{% endfor %}
+{% if inventory_hostname != backup_repository_host %}
+repo1-host={{ hostvars[backup_repository_host].node.dns_name }}
+repo1-host-type=tls
+repo1-host-port={{ backup_port }}
+repo1-host-ca-file=/etc/pgbackrest/ca.pem
+repo1-host-cert-file=/etc/pgbackrest/cert.pem
+repo1-host-key-file=/etc/pgbackrest/key.pem
+{% endif %}
+
+[{{ cluster.name }}]
+pg1-path={{ cluster.data_dir }}
+pg1-port={{ pg_port }}
+pg1-socket-path=/run/pg-ha-patroni
+{% if inventory_hostname == backup_repository_host %}
+{% for host in groups['postgres_cluster'] if host != backup_repository_host %}
+pg{{ loop.index + 1 }}-host={{ hostvars[host].node.dns_name }}
+pg{{ loop.index + 1 }}-host-type=tls
+pg{{ loop.index + 1 }}-host-port={{ backup_port }}
+pg{{ loop.index + 1 }}-host-ca-file=/etc/pgbackrest/ca.pem
+pg{{ loop.index + 1 }}-host-cert-file=/etc/pgbackrest/cert.pem
+pg{{ loop.index + 1 }}-host-key-file=/etc/pgbackrest/key.pem
+pg{{ loop.index + 1 }}-path={{ cluster.data_dir }}
+pg{{ loop.index + 1 }}-port={{ pg_port }}
+pg{{ loop.index + 1 }}-socket-path=/run/pg-ha-patroni
+{% endfor %}
+{% endif %}

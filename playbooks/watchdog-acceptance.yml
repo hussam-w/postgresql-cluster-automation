@@ -1,0 +1,99 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: watchdog-acceptance
+
+- name: Verify healthy quorum and replication before fencing qualification
+  ansible.builtin.import_playbook: verify.yml
+- name: Verify watchdog fencing of a stalled primary authority
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Require explicit bounded primary fencing test
+      ansible.builtin.assert:
+        that: watchdog_test_confirmation | default('') == 'TEST PRIMARY WATCHDOG FENCING'
+      run_once: true
+    - name: Record the current primary as the sole fault target
+      ansible.builtin.set_fact:
+        fencing_target: '{{ current_primary }}'
+    - name: Capture kernel boot identity before the experiment
+      ansible.builtin.command:
+        argv: [cat, /proc/sys/kernel/random/boot_id]
+      changed_when: false
+      register: before_fencing_boot
+      when: inventory_hostname == fencing_target
+    - name: Inspect the already armed watchdog without opening its device
+      ansible.builtin.command:
+        argv: [cat, /sys/class/watchdog/watchdog0/state]
+      changed_when: false
+      register: fencing_watchdog
+      when: inventory_hostname == fencing_target
+    - name: Require the watchdog to be armed before stalling Patroni
+      ansible.builtin.assert:
+        that: fencing_watchdog.stdout | trim == 'active'
+      when: inventory_hostname == fencing_target
+    - name: Schedule automatic process recovery if watchdog fencing fails
+      ansible.builtin.command:
+        argv: [systemd-run, --unit=pg-ha-fencing-test-rollback, --on-active=45s, --timer-property=AccuracySec=1s, /usr/bin/systemctl, kill, --kill-who=main, --signal=CONT, pg-ha-patroni]
+      when: inventory_hostname == fencing_target
+    - name: Stall only Patroni on the primary to exercise its armed watchdog
+      ansible.builtin.command:
+        argv: [systemctl, kill, --kill-who=main, --signal=STOP, pg-ha-patroni]
+      when: inventory_hostname == fencing_target
+    - name: Allow the watchdog timeout and reboot to occur
+      ansible.builtin.wait_for:
+        timeout: 45
+      delegate_to: localhost
+      become: false
+      run_once: true
+    - name: Wait for authenticated management access after the watchdog reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 150
+        sleep: 5
+      when: inventory_hostname == fencing_target
+    - name: Capture boot identity after fencing
+      ansible.builtin.command:
+        argv: [cat, /proc/sys/kernel/random/boot_id]
+      changed_when: false
+      register: after_fencing_boot
+      when: inventory_hostname == fencing_target
+    - name: Prove the stalled primary was actually rebooted
+      ansible.builtin.assert:
+        that: before_fencing_boot.stdout != after_fencing_boot.stdout
+      when: inventory_hostname == fencing_target
+    - name: Wait for the intact database to rejoin after fencing
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:{{ patroni_port }}/patroni'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+      register: fencing_recovery
+      retries: 60
+      delay: 2
+      until: fencing_recovery.status == 200 and fencing_recovery.json.state == 'running' and fencing_recovery.json.timeline is not none
+    - name: Wait for role routing after the reboot
+      ansible.builtin.command:
+        argv: [/usr/local/libexec/pg-ha/check-vip]
+      changed_when: false
+      register: fencing_routing
+      retries: 45
+      delay: 2
+      until: fencing_routing.rc == 0
+    - name: Record the actual watchdog reboot evidence
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'host': fencing_target, 'old_boot_id': before_fencing_boot.stdout, 'new_boot_id': after_fencing_boot.stdout, 'watchdog_was_armed': true, 'database_rejoined': true} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/watchdog-evidence.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      when: inventory_hostname == fencing_target
+- name: Require complete post-fencing health and identities
+  ansible.builtin.import_playbook: verify.yml
+- name: Verify application endpoint behavior after fencing
+  ansible.builtin.import_playbook: endpoints-verify.yml

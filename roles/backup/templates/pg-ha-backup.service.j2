@@ -1,0 +1,30 @@
+[Unit]
+Description=Mutually authenticated pgBackRest transport
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor={{ cluster.data_dir }} {{ backup_repository_path }}
+{% if cluster.wal_dir is defined %}
+RequiresMountsFor={{ cluster.wal_dir }}
+{% endif %}
+{% if storage_paths is defined and inventory_hostname == backup_repository_host %}
+AssertPathIsMountPoint={{ storage_paths.backup_mount }}
+{% endif %}
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/bin/pgbackrest server
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+{% if cluster.wal_dir is defined %}
+ReadWritePaths={{ cluster.wal_dir | dirname }}
+{% endif %}
+ReadWritePaths={{ cluster.postgres_mount }} /var/log/pgbackrest /var/lib/pgbackrest{% if inventory_hostname == backup_repository_host %} {{ backup_repository_path }}{% endif %}
+
+PrivateTmp=true
+[Install]
+WantedBy=multi-user.target

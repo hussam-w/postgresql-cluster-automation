@@ -1,0 +1,74 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: platform-repositories
+
+- name: Provision authenticated package source and inspect exact candidate releases
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  vars:
+    selected_pg_major: "{{ (postgresql_deployment | default({})) | postgres_major((cluster | default({})).get('packages', {})) }}"
+  tasks:
+    - name: Validate selected major before repository changes
+      ansible.builtin.assert:
+        that:
+          - selected_pg_major | int >= 14
+          - postgresql_version is not defined or selected_pg_major == postgresql_version
+    - name: Restrict platform implementation to discovered operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version == '22.04'
+          - ansible_architecture == 'x86_64'
+          - ansible_hostname == inventory_hostname
+    - name: Install repository verification and infrastructure utilities
+      ansible.builtin.apt:
+        name: [ca-certificates, gnupg, lvm2, nftables, iputils-arping, python3-apt]
+        state: present
+        update_cache: true
+        policy_rc_d: 101
+    - name: Create repository-scoped key directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+    - name: Download official PGDG signing certificate over verified HTTPS
+      ansible.builtin.get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /etc/apt/keyrings/pgdg.asc
+        mode: '0644'
+    - name: Inspect signing certificate fingerprint without importing global trust
+      ansible.builtin.command:
+        argv: [gpg, --batch, --show-keys, --with-colons, /etc/apt/keyrings/pgdg.asc]
+      changed_when: false
+      register: pgdg_key
+    - name: Require the official PGDG primary signing key
+      ansible.builtin.assert:
+        that: "'fpr:::::::::B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8:' in pgdg_key.stdout"
+    - name: Configure narrowly scoped signed PGDG repository
+      ansible.builtin.copy:
+        content: "deb [arch=amd64 signed-by=/etc/apt/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt jammy-pgdg main\n"
+        dest: /etc/apt/sources.list.d/pg-ha-pgdg.list
+        mode: '0644'
+        backup: true
+      register: pgdg_source
+    - name: Refresh authenticated package metadata
+      ansible.builtin.apt:
+        update_cache: true
+      when: pgdg_source.changed
+    - name: Query candidate packages without installing database services
+      ansible.builtin.command:
+        argv: [apt-cache, policy, postgresql-common, 'postgresql-{{ selected_pg_major }}', 'postgresql-client-{{ selected_pg_major }}', patroni, etcd-server, etcd-client, haproxy, pgbouncer, keepalived, python3-psycopg2, python3-etcd3gw, pgbackrest]
+      changed_when: false
+      register: candidates
+    - name: Save nonsecret package provenance on the controller
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ candidates.stdout }}\n"
+        dest: "{{ playbook_dir }}/../artifacts/discovery/{{ inventory_hostname }}-packages.txt"
+        mode: '0644'
+      delegate_to: localhost
+      become: false

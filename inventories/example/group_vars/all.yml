@@ -1,0 +1,96 @@
+---
+# Required environment policy; null means deliberately unspecified.
+cluster:
+  # Optional overrides; ports must be distinct unprivileged TCP ports.
+  ports: {postgres: 5432, pgbouncer: 6432, patroni: 8008, etcd_client: 2379, etcd_peer: 2380, write: 5000, read: 5001}
+  name: null
+  bootstrap_host: null
+  etcd_token: null
+  vip: null
+  vip_prefix: null
+  vip_dns_name: null
+  vrid: null
+  # Explicit legacy paths, or derived by the opt-in storage_layout profile.
+  # The profile never migrates an existing data directory or WAL.
+  data_dir: null
+  etcd_data_dir: null
+  postgres_mount: null
+  etcd_mount: null
+  allowed_filesystems: null
+  min_free_bytes: null
+  min_ram_mb: null
+  min_vcpus: null
+  locale: null
+  watchdog_device: null
+  client_cidrs: null
+  admin_cidrs: null
+  # Exact versions from approved, signed apt repositories already configured on hosts.
+  # Include transitive dependencies in your immutable repository snapshot/lock.
+  packages:
+    postgresql-common: null
+    postgresql-17: null
+    postgresql-client-17: null
+    patroni: null
+    haproxy: null
+    pgbouncer: null
+    keepalived: null
+    python3-psycopg2: null
+    python3-etcd3gw: null
+  etcd_artifact: {url: null, sha256: null}
+  # Must match installed binary output; tested minimum feature families documented in README.
+  expected_versions: {patroni: null, etcd: null, haproxy: null, pgbouncer: null, keepalived: null}
+  replication:
+    mode: null # strict_sync or async
+    acknowledge_async_data_loss: false
+    synchronous_node_count: null
+    maximum_lag_on_failover: null
+    read_lag_bytes: null
+    ttl: null
+    loop_wait: null
+    retry_timeout: null
+    max_slot_wal_keep_size_mb: null
+    max_wal_senders: null
+    max_replication_slots: null
+  postgres:
+    max_connections: null
+    superuser_reserved_connections: null
+    shared_buffers_mb: null
+    max_wal_size_mb: null
+  pool:
+    mode: null # session or transaction; validate application compatibility first
+    max_client_conn: null
+    default_pool_size: null
+    reserve_pool_size: null
+    max_db_connections: null
+  timeouts: {connect_seconds: null, client_seconds: null, server_seconds: null}
+  etcd: {heartbeat_ms: null, election_ms: null, quota_bytes: null}
+  backup:
+    # Operator-provided executable, already installed and tested; receives WAL path/name.
+    archive_executable: null
+    restore_executable: null
+    destination_description: null
+    retention_description: null
+    rpo_seconds: null
+    rto_seconds: null
+  # These are change-ticket/evidence references, not claims inferred by automation.
+  evidence:
+    network_and_vrrp: null
+    firewall_policy: null
+    fencing_test: null
+    backup_restore_test: null
+    repository_provenance: null
+    monitoring_and_alerts: null
+    exclusive_change_lock: null
+
+# Security vars belong in an encrypted Vault file, never in this example.
+# vault_pg_superuser_password: ...
+# vault_pg_replication_password: ...
+# vault_patroni_api_password: ...
+# vault_app_users: [{name: ..., password: ...}]
+# application_databases: [{name: ..., owner: ...}]
+# Per-host tls_sources: mapping of service names (etcd, dcs, patroni, postgres,
+# pgbouncer, haproxy) to {ca: controller_path, cert: controller_path, key: controller_path}.
+# HAProxy certificate and key are combined by Ansible for mTLS health checks.
+# Four separate issuing trust domains with managed backup: database, Patroni
+# management, DCS, and backup. See docs/operator-guide.md for additional
+# platform/backup inputs needed beyond this core contract skeleton.

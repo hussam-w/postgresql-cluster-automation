@@ -1,0 +1,61 @@
+---
+- name: Record the immutable bootstrap plan before creating distributed state
+  ansible.builtin.copy:
+    backup: true
+    content: "{{ {'cluster': cluster, 'nodes': cluster_nodes} | to_nice_json }}"
+    dest: /var/lib/pg-ha-bootstrap.json
+    owner: root
+    group: root
+    mode: '0600'
+    force: false
+
+- name: Create isolated etcd service account
+  ansible.builtin.user:
+    name: etcd
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Create versioned upstream binary directory
+  ansible.builtin.file:
+    path: "{{ etcd_binary_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Inspect optional controller cache by its cryptographic digest
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../artifacts/etcd-v{{ cluster.expected_versions.etcd }}-linux-amd64.tar.gz"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: cached_etcd
+  retries: 240
+  delay: 5
+  until: not cached_etcd.stat.exists or cached_etcd.stat.checksum | default('') == cluster.etcd_artifact.sha256
+
+- name: Distribute only a complete verified controller archive
+  ansible.builtin.copy:
+    backup: true
+    src: "{{ playbook_dir }}/../artifacts/etcd-v{{ cluster.expected_versions.etcd }}-linux-amd64.tar.gz"
+    dest: "/var/cache/etcd-{{ cluster.expected_versions.etcd }}.tar.gz"
+    mode: '0644'
+  when: cached_etcd.stat.checksum | default('') == cluster.etcd_artifact.sha256
+
+- name: Download exact upstream archive and require its independently recorded checksum
+  ansible.builtin.get_url:
+    url: "{{ cluster.etcd_artifact.url }}"
+    checksum: "sha256:{{ cluster.etcd_artifact.sha256 }}"
+    dest: "/var/cache/etcd-{{ cluster.expected_versions.etcd }}.tar.gz"
+    mode: '0644'
+    timeout: 60
+
+- name: Extract release into its versioned non-package path
+  ansible.builtin.unarchive:
+    src: "/var/cache/etcd-{{ cluster.expected_versions.etcd }}.tar.gz"
+    remote_src: true
+    dest: "{{ etcd_binary_dir }}"
+    extra_opts: [--strip-components=1, --no-same-owner]
+    owner: root
+    group: root

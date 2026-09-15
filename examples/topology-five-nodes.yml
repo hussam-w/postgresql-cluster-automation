@@ -1,0 +1,23 @@
+---
+# Overlay onto a complete Type A environment contract, not a substitute for it.
+# postgres_cluster: pg01,pg02,pg03,pg04,pg05
+# etcd_cluster and routers: pg01,pg04,pg05
+# cluster.bootstrap_host must be pg01.
+# Change this one major selection; provide matching exact package pins.
+postgresql_version: '17'
+postgresql_deployment:
+  mode: cluster
+  architecture: type_a
+  major: '{{ postgresql_version }}'
+  topology:
+    primary: pg01
+    replicas: [pg02, pg03]
+    standby: [pg04, pg05]
+    total_nodes: 5
+    replica_count: 2
+    standby_count: 2
+  extensions: [pg_stat_statements, pg_stat_kcache, pgaudit, pgcrypto]
+  extension_databases: [postgres]
+postgresql_operation: plan
+postgresql_allow_package_install: false
+postgresql_allow_extension_create: false

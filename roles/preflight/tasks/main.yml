@@ -1,0 +1,108 @@
+---
+- name: Require complete inventory and explicit execution mode
+  ansible.builtin.assert:
+    that:
+      - deployment_mode in ['audit', 'bootstrap', 'resume', 'verify']
+      - groups.get('postgres_cluster', []) | length >= 1
+      - ansible_play_hosts_all | sort == groups['postgres_cluster'] | sort
+      - ansible_play_hosts | sort == groups['postgres_cluster'] | sort
+      - not ansible_check_mode or deployment_mode == 'audit'
+      - deployment_mode != 'bootstrap' or bootstrap_confirmation == 'CREATE ' ~ (cluster.name | default(''))
+      - deployment_mode != 'resume' or bootstrap_confirmation == 'RESUME ' ~ (cluster.name | default(''))
+    fail_msg: 'Use the complete inventory without --limit; bootstrap requires bootstrap_confirmation="CREATE <cluster-name>". Check mode supports audit only.'
+  run_once: true
+
+- name: Reject inconsistent cluster-wide policy between hosts
+  ansible.builtin.assert:
+    that: cluster == hostvars[groups['postgres_cluster'][0]].cluster
+    fail_msg: 'cluster policy must be identical on all nodes; put per-host values only in node.'
+
+- name: Build nonsecret topology
+  ansible.builtin.set_fact:
+    cluster_nodes: "{{ dict(groups['postgres_cluster'] | zip(groups['postgres_cluster'] | map('extract', hostvars, 'node'))) }}"
+
+- name: Validate mandatory environment contract
+  ansible.builtin.assert:
+    that: contract_errors | length == 0
+    fail_msg: "{{ contract_errors }}"
+  vars:
+    contract_errors: "{{ cluster | validate_cluster_contract(cluster_nodes, groups.get('etcd_cluster', []), groups.get('routers', [])) }}"
+
+- name: Inspect hosts without mutation
+  cluster_preflight:
+    cluster: "{{ cluster }}"
+    node: "{{ node }}"
+    nodes: "{{ cluster_nodes }}"
+    mode: "{{ deployment_mode }}"
+    core: "{{ inventory_hostname in groups['etcd_cluster'] }}"
+    router: "{{ inventory_hostname in groups.get('routers', []) }}"
+
+- name: Validate private deployment inputs
+  ansible.builtin.assert:
+    that:
+      - vault_pg_superuser_password | default('') | length >= 24
+      - vault_pg_replication_password | default('') | length >= 24
+      - vault_patroni_api_password | default('') | length >= 24
+      - vault_app_users | default([]) | length > 0
+      - application_databases | default([]) | length > 0
+      - tls_sources is mapping
+  no_log: true
+  when: deployment_mode in ['bootstrap', 'resume', 'verify']
+
+- name: Validate application role names and passwords
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-z][a-z0-9_]{0,62}$')
+      - item.name not in ['postgres', 'replicator', 'pgbouncer', 'patroni', 'etcd']
+      - item.password | length >= 24
+  loop: "{{ vault_app_users | default([]) }}"
+  no_log: true
+  when: deployment_mode in ['bootstrap', 'resume', 'verify']
+
+- name: Require every service TLS source mapping before installing packages
+  ansible.builtin.assert:
+    that:
+      - tls_sources[item] is mapping
+      - tls_sources[item].ca is string
+      - tls_sources[item].cert is string
+      - tls_sources[item].key is string
+  loop: "{{ ['postgres', 'patroni', 'dcs', 'pgbouncer'] + (['etcd'] if inventory_hostname in groups['etcd_cluster'] else []) + (['haproxy'] if inventory_hostname in groups['routers'] and haproxy_enabled else []) }}"
+  no_log: true
+  when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Confirm TLS source files exist on the controller before host mutations
+  ansible.builtin.stat:
+    path: "{{ tls_sources[item.0][item.1] }}"
+    get_checksum: false
+  loop: "{{ (['postgres', 'patroni', 'dcs', 'pgbouncer'] + (['etcd'] if inventory_hostname in groups['etcd_cluster'] else []) + (['haproxy'] if inventory_hostname in groups['routers'] and haproxy_enabled else [])) | product(['ca', 'cert', 'key']) | list }}"
+  delegate_to: localhost
+  become: false
+  register: tls_source_checks
+  no_log: true
+  when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Reject missing TLS sources
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+  loop: "{{ tls_source_checks.results | default([]) }}"
+  no_log: true
+  when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Validate database owners and aggregate per-node connection budget
+  ansible.builtin.assert:
+    that:
+      - item.name is match('^[a-z][a-z0-9_]{0,62}$')
+      - item.name not in ['postgres', 'template0', 'template1', 'pgbouncer']
+      - item.owner in (vault_app_users | map(attribute='name') | list)
+      - application_databases | map(attribute='name') | unique | length == application_databases | length
+      - vault_app_users | map(attribute='name') | unique | length == vault_app_users | length
+      - (application_databases | length * cluster.pool.max_db_connections) + cluster.postgres.superuser_reserved_connections + groups['postgres_cluster'] | length + 5 < cluster.postgres.max_connections
+  loop: "{{ application_databases | default([]) }}"
+  no_log: true
+  when: deployment_mode in ['bootstrap', 'resume', 'verify']
+
+- name: Report approved scope
+  ansible.builtin.debug:
+    msg: "Mode={{ deployment_mode }}; host={{ inventory_hostname }}; core={{ inventory_hostname in groups['etcd_cluster'] }}; PostgreSQL {{ postgresql_major }} on Ubuntu 22.04. No removal/reinitialization/forced promotion is included."

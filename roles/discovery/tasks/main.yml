@@ -1,0 +1,26 @@
+---
+- name: Inspect facts and existing state without reading secrets or changing services
+  infrastructure_discovery:
+    management_ip: "{{ management_ip }}"
+    expected_hostname: "{{ expected_hostname | default(none) }}"
+    peers: "{{ groups['target_vms'] | map('extract', hostvars, 'management_ip') | list }}"
+    ssh_port: "{{ discovery_ssh_port }}"
+    admin_user: "{{ ansible_user }}"
+    additional_data_roots: "{{ discovery_additional_data_roots | default([]) }}"
+  register: discovery_observation
+  ignore_errors: true
+  ignore_unreachable: true
+  timeout: 180
+  # Keep host failures in the final report; never continue into deployment.
+  no_log: true
+
+- name: Show nonsecret discovery summary
+  ansible.builtin.debug:
+    msg:
+      target: "{{ inventory_hostname }}"
+      management_ip: "{{ management_ip }}"
+      ssh_and_module_access: "{{ discovery_observation.report is defined }}"
+      privileged_observation: "{{ discovery_observation.report.privileged | default(false) }}"
+      coverage_complete: "{{ discovery_observation.report.coverage_complete | default(false) }}"
+      existing_state_detected: "{{ discovery_observation.report.existing_state_detected | default('unknown') }}"
+      decision: 'STOP: discovery only; intended topology and bootstrap are not authorized by these observations.'

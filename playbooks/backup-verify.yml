@@ -1,0 +1,50 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: backup-verify
+
+- name: Create and verify an encrypted full backup without changing live database identity
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Initialize repository stanza against the live cluster
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', stanza-create]
+      become_user: postgres
+      when: inventory_hostname == backup_repository_host
+    - name: Verify archive push and repository connectivity
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', check]
+      become_user: postgres
+      changed_when: false
+      when: inventory_hostname == backup_repository_host
+    - name: Create an encrypted full backup using pgBackRest primary discovery
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', --type=full, backup]
+      become_user: postgres
+      when: inventory_hostname == backup_repository_host
+    - name: Inspect backup metadata
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', --output=json, info]
+      become_user: postgres
+      changed_when: false
+      register: backup_info
+      when: inventory_hostname == backup_repository_host
+    - name: Require a complete backup with healthy stanza status
+      ansible.builtin.assert:
+        that:
+          - (backup_info.stdout | from_json)[0].status.code == 0
+          - (backup_info.stdout | from_json)[0].backup | length > 0
+      when: inventory_hostname == backup_repository_host
+    - name: Record nonsecret backup evidence
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ backup_info.stdout }}'
+        dest: '{{ playbook_dir }}/../artifacts/backup-info.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      when: inventory_hostname == backup_repository_host

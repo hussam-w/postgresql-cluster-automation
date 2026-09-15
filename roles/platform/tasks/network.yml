@@ -1,0 +1,78 @@
+---
+- name: Inspect previous managed netplan fragment
+  ansible.builtin.stat:
+    path: /etc/netplan/90-pg-ha-service.yaml
+  register: previous_netplan
+
+- name: Preserve previous managed netplan for timed recovery
+  ansible.builtin.copy:
+    backup: true
+    remote_src: true
+    src: /etc/netplan/90-pg-ha-service.yaml
+    dest: /var/lib/pg-ha-platform/netplan.previous
+    mode: '0600'
+  when: previous_netplan.stat.exists
+
+- name: Install bounded network rollback script
+  ansible.builtin.copy:
+    backup: true
+    content: |
+      #!/bin/sh
+      set -eu
+      {% if previous_netplan.stat.exists %}
+      cp /var/lib/pg-ha-platform/netplan.previous /etc/netplan/90-pg-ha-service.yaml
+      {% else %}
+      rm -f /etc/netplan/90-pg-ha-service.yaml
+      {% endif %}
+      /usr/sbin/netplan apply
+    dest: /var/lib/pg-ha-platform/network-rollback
+    mode: '0700'
+
+- name: Stage service network fragment without replacing DHCP configuration
+  ansible.builtin.template:
+    backup: true
+    src: service-network.yml.j2
+    dest: /etc/netplan/90-pg-ha-service.yaml
+    mode: '0600'
+  register: service_network
+
+- name: Validate combined netplan configuration before applying
+  ansible.builtin.command:
+    argv: [netplan, generate]
+  changed_when: false
+
+- name: Schedule automatic rollback before activating changed network configuration
+  ansible.builtin.command:
+    argv: [systemd-run, --unit=pg-ha-network-rollback, --on-active=180s, /var/lib/pg-ha-platform/network-rollback]
+  when: service_network.changed
+
+- name: Apply validated networking
+  ansible.builtin.command:
+    argv: [netplan, apply]
+  when: service_network.changed
+
+- name: Verify management connection remains usable
+  ansible.builtin.wait_for_connection:
+    timeout: 60
+    delay: 3
+
+- name: Confirm service address assignment
+  ansible.builtin.command:
+    argv: [ip, -j, -4, address, show, dev, '{{ node.interface }}']
+  register: assigned_addresses
+  changed_when: false
+  failed_when: node.address not in (assigned_addresses.stdout | from_json | map(attribute='addr_info') | flatten | map(attribute='local') | list)
+
+- name: Require stable service source addresses for outgoing peer connections
+  ansible.builtin.command:
+    argv: [ip, -j, route, get, '{{ hostvars[item].node.address }}']
+  register: peer_route
+  changed_when: false
+  failed_when: (peer_route.stdout | from_json)[0].prefsrc | default('') != node.address
+  loop: "{{ groups['postgres_cluster'] | difference([inventory_hostname]) }}"
+
+- name: Cancel rollback only after connection, address and peer source validation
+  ansible.builtin.systemd_service:
+    name: pg-ha-network-rollback.timer
+    state: stopped
+  when: service_network.changed

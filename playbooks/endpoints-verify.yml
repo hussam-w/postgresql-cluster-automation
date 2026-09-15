@@ -1,0 +1,75 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: endpoints-verify
+
+- name: Verify actual SQL reads and writes through the application VIP
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Commit a durable acceptance marker through the write endpoint
+      community.postgresql.postgresql_query:
+        login_host: '{{ cluster.vip_dns_name }}'
+        login_port: '{{ write_port }}'
+        login_db: '{{ application_databases[0].name }}'
+        login_user: '{{ application_databases[0].owner }}'
+        login_password: "{{ (vault_app_users | selectattr('name', 'equalto', application_databases[0].owner) | first).password }}"
+        ssl_mode: verify-full
+        ca_cert: /etc/pg-ha/postgres/ca.pem
+        query:
+          - CREATE TABLE IF NOT EXISTS public.pg_ha_acceptance (id integer PRIMARY KEY, note text NOT NULL)
+          - INSERT INTO public.pg_ha_acceptance VALUES (1, 'durable acceptance marker') ON CONFLICT (id) DO NOTHING
+          - SELECT pg_is_in_recovery() AS recovery, count(*) AS markers FROM public.pg_ha_acceptance
+      register: endpoint_write
+      no_log: true
+      run_once: true
+    - name: Require primary execution and a committed marker
+      ansible.builtin.assert:
+        that:
+          - not endpoint_write.query_result[0].recovery
+          - endpoint_write.query_result[0].markers | int >= 1
+      run_once: true
+    - name: Read replicated marker through the read endpoint from every node
+      community.postgresql.postgresql_query:
+        login_host: '{{ cluster.vip_dns_name }}'
+        login_port: '{{ read_port }}'
+        login_db: '{{ application_databases[0].name }}'
+        login_user: '{{ application_databases[0].owner }}'
+        login_password: "{{ (vault_app_users | selectattr('name', 'equalto', application_databases[0].owner) | first).password }}"
+        ssl_mode: verify-full
+        ca_cert: /etc/pg-ha/postgres/ca.pem
+        query: SELECT pg_is_in_recovery() AS recovery, count(*) AS markers FROM public.pg_ha_acceptance
+      no_log: true
+      register: endpoint_read
+      retries: 20
+      delay: 2
+      until: endpoint_read is succeeded and endpoint_read.query_result[0].recovery and endpoint_read.query_result[0].markers | int >= 1
+    - name: Confirm a read-only backend actually rejects writes
+      community.postgresql.postgresql_query:
+        login_host: '{{ cluster.vip_dns_name }}'
+        login_port: '{{ read_port }}'
+        login_db: '{{ application_databases[0].name }}'
+        login_user: '{{ application_databases[0].owner }}'
+        login_password: "{{ (vault_app_users | selectattr('name', 'equalto', application_databases[0].owner) | first).password }}"
+        ssl_mode: verify-full
+        ca_cert: /etc/pg-ha/postgres/ca.pem
+        query: UPDATE public.pg_ha_acceptance SET note = note WHERE false
+      register: rejected_write
+      failed_when: false
+      no_log: true
+    - name: Require PostgreSQL read-only transaction rejection
+      ansible.builtin.assert:
+        that: "'read-only transaction' in (rejected_write.msg | default(''))"
+    - name: Record successful endpoint acceptance
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'vip': cluster.vip, 'write_port': write_port, 'read_port': read_port, 'verified_tls': true, 'committed_marker': true, 'replicated_read': true, 'replica_rejected_write': true} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/endpoints-evidence.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      run_once: true

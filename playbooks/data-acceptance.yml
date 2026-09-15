@@ -1,0 +1,10 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: data-acceptance
+
+- name: Verify application traffic before taking the recovery baseline
+  ansible.builtin.import_playbook: endpoints-verify.yml
+- name: Verify archival and a complete encrypted backup
+  ansible.builtin.import_playbook: backup-verify.yml

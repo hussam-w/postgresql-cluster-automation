@@ -1,0 +1,58 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: ip-migration-patroni-refresh
+
+- name: Rebuild Patroni client connections after address retirement
+  hosts: postgres_cluster
+  gather_facts: false
+  serial: 1
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Capture protected Patroni connection diagnostics
+      ansible.builtin.command:
+        argv: [journalctl, -u, pg-ha-patroni, -n, '60', --no-pager]
+      register: migration_patroni_log
+      changed_when: false
+      no_log: true
+    - name: Save protected diagnostics without printing configuration
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ migration_patroni_log.stdout }}'
+        dest: '{{ playbook_dir }}/../artifacts/ip-migration-patroni-{{ inventory_hostname }}.log'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      no_log: true
+    - name: Require live etcd quorum before refreshing client connections
+      ansible.builtin.command:
+        argv: ['{{ etcd_binary_dir }}/etcdctl', '--endpoints=https://{{ node.dns_name }}:{{ cluster.ports.etcd_client }}', --cacert=/etc/pg-ha/etcd/ca.pem, --cert=/etc/pg-ha/etcd/cert.pem, --key=/etc/pg-ha/etcd/key.pem, endpoint, health, --cluster]
+      changed_when: false
+    - name: Inspect current PostgreSQL role through local SQL
+      community.postgresql.postgresql_query:
+        login_unix_socket: /run/pg-ha-patroni
+        login_port: 5432
+        login_db: postgres
+        query: SELECT pg_is_in_recovery() AS recovery
+      become_user: postgres
+      register: refresh_role
+    - name: Refresh only a replica authority, never an active primary
+      ansible.builtin.systemd_service:
+        name: pg-ha-patroni
+        state: restarted
+      when: refresh_role.query_result[0].recovery
+    - name: Require readable authenticated DCS membership after client refresh
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:8008/cluster'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+        timeout: 10
+      register: refresh_cluster
+      retries: 20
+      delay: 2
+      until: refresh_cluster.status == 200

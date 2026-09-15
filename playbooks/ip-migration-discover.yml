@@ -1,0 +1,35 @@
+---
+- name: Capture nonsecret prerequisites for the requested address migration
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect netplan fragments
+      ansible.builtin.shell: cat /etc/netplan/*.yaml
+      changed_when: false
+      register: network_config
+    - name: Inspect addresses and source routes
+      ansible.builtin.command:
+        argv: [ip, -j, address, show]
+      changed_when: false
+      register: network_addresses
+    - name: Inspect routes
+      ansible.builtin.command:
+        argv: [ip, -j, route, show]
+      changed_when: false
+      register: network_routes
+    - name: Read authenticated membership
+      ansible.builtin.command:
+        argv: [patronictl, -c, /etc/pg-ha/patroni/patroni.yml, list, -f, json]
+      become_user: postgres
+      changed_when: false
+      register: migration_members
+    - name: Record nonsecret network discovery
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'netplan': network_config.stdout, 'addresses': network_addresses.stdout | from_json, 'routes': network_routes.stdout | from_json, 'members': migration_members.stdout | from_json, 'mac': ansible_facts[node.interface].macaddress} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/ip-migration-{{ inventory_hostname }}.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false

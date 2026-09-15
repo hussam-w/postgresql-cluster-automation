@@ -1,0 +1,92 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: provision-cluster
+
+- name: Validate controller-side inputs
+  ansible.builtin.import_playbook: validate-inputs.yml
+
+- name: Inventory-wide safety gate before any deployment changes
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  strategy: linear
+  roles:
+    - role: common
+      tags: [always]
+    - role: preflight
+      tags: [always]
+
+- name: Prepare fresh hosts without starting database services
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: prepare
+      when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Configure every initial etcd member before starting consensus
+  hosts: etcd_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: etcd
+      when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Provision Patroni primary first then explicitly provision empty replicas
+  hosts: postgres_cluster
+  order: inventory
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: patroni
+      when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Configure application identities and node-local poolers
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: pgbouncer
+      when: deployment_mode in ['bootstrap', 'resume']
+
+- name: Activate validated routing one machine at a time
+  hosts: routers
+  serial: 1
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: routing
+      when: deployment_mode in ['bootstrap', 'resume'] and haproxy_enabled
+
+- name: Verify cluster state and record successful initial ownership
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: common
+    - role: health
+      when: deployment_mode in ['bootstrap', 'resume', 'verify']
+  post_tasks:
+    - name: Record successful nonsecret inventory and policy
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'cluster': cluster, 'nodes': cluster_nodes} | to_nice_json }}"
+        dest: /var/lib/pg-ha/identity.json
+        owner: root
+        group: root
+        mode: '0600'
+      when: deployment_mode in ['bootstrap', 'resume']

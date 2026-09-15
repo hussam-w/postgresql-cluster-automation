@@ -1,0 +1,42 @@
+[Unit]
+Description=Patroni authority for PostgreSQL {{ postgresql_major }}
+Wants=network-online.target
+Requires=pg-ha-watchdog.service
+After=network-online.target pg-ha-watchdog.service
+RequiresMountsFor={{ cluster.data_dir }}
+{% if cluster.wal_dir is defined %}
+RequiresMountsFor={{ cluster.wal_dir }}
+{% endif %}
+{% if storage_paths is defined %}
+AssertPathIsMountPoint={{ storage_paths.data_mount }}
+{% endif %}
+Conflicts=postgresql.service
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStartPre=/usr/local/libexec/pg-ha/wait-clock
+ExecStart=/usr/bin/patroni /etc/pg-ha/patroni/patroni.yml
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec={{ cluster.replication.ttl * 2 }}
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=pg-ha-patroni
+RuntimeDirectoryMode=0750
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+{% if cluster.wal_dir is defined %}
+ReadWritePaths={{ cluster.wal_dir | dirname }}
+{% endif %}
+ReadWritePaths={{ cluster.data_dir }} /run/pg-ha-patroni /var/log/pgbackrest /var/lib/pgbackrest{% if inventory_hostname == backup_repository_host | default('') %} {{ backup_repository_path }}{% endif %}
+
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

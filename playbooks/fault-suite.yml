@@ -1,0 +1,33 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: fault-suite
+
+- name: Validate the complete baseline before a bounded failure suite
+  ansible.builtin.import_playbook: verify.yml
+- name: Exercise one component at a time and require complete recovery
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    deployment_mode: verify
+  roles: [common]
+  tasks:
+    - name: Require explicit failure-suite selection
+      ansible.builtin.assert:
+        that: failure_suite_confirmation | default('') == 'TEST BOUNDED SERVICE FAILURES'
+      run_once: true
+    - name: Exercise and recover each single component before the next experiment
+      ansible.builtin.include_tasks: tasks/fault-case.yml
+      loop:
+        - {service: pg-ha-haproxy, target: vip}
+        - {service: pg-ha-keepalived, target: vip}
+        - {service: pg-ha-etcd, target: primary}
+        - {service: pg-ha-pgbouncer, target: primary}
+        - {service: pg-ha-patroni, target: primary}
+      loop_control:
+        loop_var: fault_case
+- name: Recheck application endpoint semantics after the suite
+  ansible.builtin.import_playbook: endpoints-verify.yml

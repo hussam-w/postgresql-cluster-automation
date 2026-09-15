@@ -1,0 +1,159 @@
+---
+- name: Require explicit platform scope and the complete three-node inventory
+  ansible.builtin.assert:
+    that:
+      - platform_change_confirmation == 'PROVISION PLATFORM'
+      - ansible_play_hosts_all | sort == groups['postgres_cluster'] | sort
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version == '22.04'
+      - ansible_hostname == inventory_hostname
+      - not (platform_manage_network or platform_manage_firewall) or node.interface in ansible_interfaces
+      - not (platform_manage_network or platform_manage_hosts or platform_manage_firewall) or platform_vip is defined
+      - not platform_manage_storage or platform_volume_group is defined
+      - not platform_manage_storage or platform_volumes | default([]) | length > 0
+      - not platform_manage_firewall or platform_ssh_cidrs | default([]) | length > 0
+      - not platform_manage_firewall or platform_client_cidrs | default([]) | length > 0
+      - not platform_manage_storage or platform_volume_group is match('^[a-zA-Z0-9_+.-]+$')
+
+- name: Explicitly opt in to platform_manage_storage
+  when: platform_manage_storage | bool
+  block:
+    - name: Validate dedicated volume names and reject dangerous mount targets
+      ansible.builtin.assert:
+        that:
+          - item.name is match('^pg_ha_[a-z0-9_]+$')
+          - item.mount is match('^/srv/[a-zA-Z0-9_-]+$')
+          - item.mount not in ['/', '/boot', '/home', '/etc', '/var', '/usr']
+          - item.size is match('^[1-9][0-9]*[MG]$')
+      loop: '{{ platform_volumes }}'
+
+    - name: Inspect logical volumes before creating any storage
+      ansible.builtin.command:
+        argv: [lvs, --reportformat, json, -o, 'lv_name,vg_name,lv_tags']
+      changed_when: false
+      register: platform_lvs
+
+    - name: Reject preexisting volumes without this project's ownership tag
+      ansible.builtin.assert:
+        that: "'pg_ha_managed' in item.lv_tags.split(',')"
+        fail_msg: 'A requested LV already exists without project ownership; preserve it and investigate.'
+      loop: "{{ (platform_lvs.stdout | from_json).report[0].lv | selectattr('vg_name', 'equalto', platform_volume_group) | selectattr('lv_name', 'in', platform_volumes | map(attribute='name') | list) | list }}"
+
+    - name: Allocate only unused volume-group extents without shrinking any volume
+      community.general.lvol:
+        vg: "{{ platform_volume_group }}"
+        lv: "{{ item.name }}"
+        size: "{{ item.size }}"
+        shrink: false
+        opts: --addtag pg_ha_managed
+        state: present
+      loop: "{{ platform_volumes }}"
+
+    - name: Create ext4 only on owned volumes and never overwrite an existing filesystem
+      community.general.filesystem:
+        dev: "/dev/{{ platform_volume_group }}/{{ item.name }}"
+        fstype: ext4
+        force: false
+      loop: "{{ platform_volumes }}"
+
+    - name: Persist dedicated filesystems without changing root storage
+      ansible.posix.mount:
+        src: "/dev/{{ platform_volume_group }}/{{ item.name }}"
+        path: "{{ item.mount }}"
+        fstype: ext4
+        opts: defaults,nodev,nosuid
+        state: mounted
+      loop: "{{ platform_volumes }}"
+
+- name: Create protected platform state directory
+  ansible.builtin.file:
+    path: /var/lib/pg-ha-platform
+    state: directory
+    mode: '0700'
+  when: platform_manage_storage or platform_manage_network or platform_manage_hosts or platform_manage_firewall or platform_manage_watchdog
+
+- name: Explicitly opt in to platform_manage_network
+  when: platform_manage_network | bool
+  block:
+    - name: Inspect existing managed service address
+      ansible.builtin.command:
+        argv: [ip, -j, -4, address, show, dev, '{{ node.interface }}']
+      changed_when: false
+      register: platform_addresses
+
+    - name: Check selected secondary service address for duplicate ARP responders
+      ansible.builtin.command:
+        argv: [arping, -D, -c, '3', -w, '5', -I, '{{ node.interface }}', '{{ node.address }}']
+      changed_when: false
+      when: node.address not in (platform_addresses.stdout | from_json | map(attribute='addr_info') | flatten | map(attribute='local') | list)
+
+    - name: Apply persistent service networking with timed rollback
+      ansible.builtin.include_tasks: network.yml
+
+- name: Explicitly opt in to platform_manage_hosts
+  when: platform_manage_hosts | bool
+  block:
+    - name: Install consistent internal service name resolution
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: '# {mark} PG-HA SERVICE NAMES'
+        backup: true
+        block: |
+          {% for host in groups['postgres_cluster'] %}
+          {{ hostvars[host].node.address }} {{ hostvars[host].node.dns_name }}
+          {% endfor %}
+          {{ platform_vip }} {{ platform_vip_dns }}
+
+- name: Explicitly opt in to platform_manage_firewall
+  when: platform_manage_firewall | bool
+  block:
+    - name: Apply scoped firewall with timed rollback
+      ansible.builtin.include_tasks: firewall.yml
+
+- name: Explicitly opt in to platform_manage_watchdog
+  when: platform_manage_watchdog | bool
+  block:
+    - name: Create postgres account before watchdog device ownership
+      ansible.builtin.user:
+        name: postgres
+        system: true
+        home: /var/lib/postgresql
+        create_home: false
+        shell: /bin/bash
+
+    - name: Configure software watchdog for Patroni with disarm support
+      ansible.builtin.copy:
+        backup: true
+        content: "options softdog nowayout=0\n"
+        dest: /etc/modprobe.d/pg-ha-watchdog.conf
+        mode: '0644'
+
+    - name: Persist watchdog module loading
+      ansible.builtin.copy:
+        backup: true
+        content: "softdog\n"
+        dest: /etc/modules-load.d/pg-ha-watchdog.conf
+        mode: '0644'
+
+    - name: Persist narrowly scoped watchdog ownership
+      ansible.builtin.copy:
+        backup: true
+        content: 'SUBSYSTEM=="watchdog", KERNEL=="watchdog*", OWNER="postgres", GROUP="postgres", MODE="0600"'
+        dest: /etc/udev/rules.d/99-pg-ha-watchdog.rules
+        mode: '0644'
+
+    - name: Load watchdog without opening or arming the device
+      community.general.modprobe:
+        name: softdog
+        state: present
+
+    - name: Set ownership of the watchdog character device without opening it
+      ansible.builtin.file:
+        path: /dev/watchdog
+        owner: postgres
+        group: postgres
+        mode: '0600'
+
+    - name: Configure reliable watchdog provisioning at boot
+      ansible.builtin.include_tasks: watchdog-startup.yml
+

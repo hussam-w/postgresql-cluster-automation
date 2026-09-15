@@ -1,0 +1,29 @@
+---
+- name: Validate nonsecret inputs on the controller before opening SSH connections
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require the validated model entry point for modular clusters
+      ansible.builtin.assert:
+        that:
+          - (hostvars[groups.get('postgres_cluster', [''])[0]].cluster | default({})).get('architecture') != 'modular' or (postgresql_deployment | default({})).get('architecture') == 'modular'
+        fail_msg: 'Use playbooks/postgresql.yml with an explicit modular deployment model.'
+      when: groups.get('postgres_cluster', []) | length > 0
+    - name: Require an explicit complete topology
+      ansible.builtin.assert:
+        that:
+          - groups.get('postgres_cluster', []) | length >= 1
+          - groups.get('etcd_cluster', []) | length >= 1
+        fail_msg: 'Supply postgres_cluster, etcd_cluster and routers in the real inventory.'
+
+    - name: Validate mandatory nonsecret policy before contacting hosts
+      ansible.builtin.assert:
+        that: errors | length == 0
+        fail_msg: "{{ errors }}"
+      vars:
+        input_nodes: "{{ dict(groups['postgres_cluster'] | zip(groups['postgres_cluster'] | map('extract', hostvars, 'node'))) }}"
+        input_cluster: "{{ (hostvars[groups['postgres_cluster'][0]].cluster | default({})) | cluster_components(postgresql_deployment | default({})) }}"
+        errors: "{{ input_cluster | validate_cluster_contract(input_nodes, groups['etcd_cluster'], groups['routers']) }}"

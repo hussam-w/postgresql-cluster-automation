@@ -1,0 +1,72 @@
+---
+- name: Qualify external WAL on an isolated instance without changing production
+  hosts: "{{ qa_host | mandatory }}"
+  gather_facts: false
+  become: true
+  vars:
+    qa_root: /srv/postgres/storage-wal-qa-20260913
+    qa_port: 55494
+  tasks:
+    - name: Require explicit isolated test intent
+      ansible.builtin.assert:
+        that: storage_test_confirmation | default('') == 'CREATE ISOLATED WAL TEST'
+    - name: Refuse reuse of any existing test root
+      ansible.builtin.stat:
+        path: '{{ qa_root }}'
+      register: qa_existing
+    - name: Preserve existing fixtures
+      ansible.builtin.assert:
+        that: not qa_existing.stat.exists
+    - name: Resolve the explicit test layout
+      storage_layout_info:
+        layout: {root: '{{ qa_root }}'}
+      register: qa_layout
+    - name: Prove missing mounts are refused without writes
+      storage_mount_guard:
+        paths: '{{ qa_layout.paths }}'
+      register: qa_refusal
+      ignore_errors: true
+    - name: Require failed admission and no change
+      ansible.builtin.assert:
+        that: qa_refusal.failed and not qa_refusal.changed
+    - name: Create only new private test directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      loop: ['{{ qa_root }}', '{{ qa_root }}/data', '{{ qa_root }}/wal', '{{ qa_root }}/socket', '{{ qa_root }}/replica-wal']
+    - name: Initialize only the newly admitted isolated test database with separate WAL
+      ansible.builtin.command:
+        argv: [/usr/lib/postgresql/17/bin/initdb, '-D', '{{ qa_layout.paths.data_dir }}', '--waldir={{ qa_layout.paths.wal_dir }}', '--data-checksums', '--auth=peer', '--no-locale']
+        creates: '{{ qa_layout.paths.data_dir }}/PG_VERSION'
+      become_user: postgres
+    - name: Test startup and replica-copy WAL placement then guarantee test shutdown
+      block:
+        - name: Start the isolated socket-only server
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_ctl, '-D', '{{ qa_layout.paths.data_dir }}', '-l', '{{ qa_root }}/server.log', '-o', "-c listen_addresses='' -c unix_socket_directories={{ qa_root }}/socket -p {{ qa_port }} -c shared_buffers=32MB", '-w', start]
+          become_user: postgres
+        - name: Create a new replica copy with native separate WAL placement
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_basebackup, '-h', '{{ qa_root }}/socket', '-p', '{{ qa_port | string }}', '-D', '{{ qa_root }}/replica', '--waldir={{ qa_root }}/replica-wal/pg_wal', '-X', stream, '-c', fast]
+          become_user: postgres
+        - name: Inspect the native primary and replica WAL links
+          ansible.builtin.command:
+            argv: [readlink, '-f', '{{ item }}']
+          loop: ['{{ qa_layout.paths.data_dir }}/pg_wal', '{{ qa_root }}/replica/pg_wal']
+          register: qa_links
+          changed_when: false
+        - name: Verify distinct external WAL targets
+          ansible.builtin.assert:
+            that:
+              - qa_links.results[0].stdout == qa_layout.paths.wal_dir
+              - qa_links.results[1].stdout == qa_root ~ '/replica-wal/pg_wal'
+      always:
+        - name: Stop only the test server and retain data evidence
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_ctl, '-D', '{{ qa_layout.paths.data_dir }}', '-m', fast, '-w', stop]
+          become_user: postgres
+          register: qa_stop
+          failed_when: qa_stop.rc != 0 and 'no server running' not in qa_stop.stderr

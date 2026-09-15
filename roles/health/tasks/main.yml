@@ -1,0 +1,206 @@
+---
+- name: Check managed configuration integrity before trusting runtime health
+  ansible.builtin.include_tasks: integrity.yml
+
+- name: Verify certificate/key validity and trust boundaries
+  cluster_tls_check:
+    core: "{{ inventory_hostname in groups['etcd_cluster'] }}"
+    router: "{{ haproxy_enabled and inventory_hostname in groups['routers'] }}"
+
+- name: Inspect installed package versions without updating them
+  ansible.builtin.package_facts:
+    manager: apt
+
+- name: Reject package drift from the approved manifest
+  ansible.builtin.assert:
+    that:
+      - item.key in ansible_facts.packages
+      - ansible_facts.packages[item.key] | map(attribute='version') | list == [item.value]
+    fail_msg: 'Installed package differs from the reviewed manifest; use controlled patch maintenance.'
+  loop: "{{ cluster.packages | dict2items }}"
+
+- name: Verify authenticated SQL through every pool and application database
+  community.postgresql.postgresql_query:
+    login_host: "{{ node.dns_name }}"
+    login_port: "{{ pool_port }}"
+    login_db: "{{ item.name }}"
+    login_user: "{{ item.owner }}"
+    login_password: "{{ (vault_app_users | selectattr('name', 'equalto', item.owner) | first).password }}"
+    ssl_mode: verify-full
+    ca_cert: /etc/pg-ha/pgbouncer/ca.pem
+    query: SELECT pg_is_in_recovery() AS recovery
+  loop: "{{ application_databases }}"
+  no_log: true
+  when: deployment_mode == 'verify'
+
+- name: Read cluster membership from every Patroni member over verified mTLS
+  ansible.builtin.uri:
+    url: "https://{{ node.dns_name }}:{{ patroni_port }}/cluster"
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    validate_certs: true
+    use_proxy: false
+    return_content: true
+    status_code: 200
+  register: patroni_members
+
+- name: Require expected membership and exactly one leader
+  ansible.builtin.assert:
+    that:
+      - patroni_members.json.members | map(attribute='name') | sort == groups['postgres_cluster'] | sort
+      - patroni_members.json.members | selectattr('role', 'equalto', 'leader') | list | length == 1
+    fail_msg: 'Patroni membership or single-leader invariant failed. Stop changes; do not force promotion.'
+
+- name: Determine current leader without assuming original bootstrap ownership
+  ansible.builtin.set_fact:
+    current_primary: "{{ (patroni_members.json.members | selectattr('role', 'equalto', 'leader') | first).name }}"
+
+- name: Inspect active dynamic policy instead of trusting bootstrap YAML
+  ansible.builtin.uri:
+    url: "https://{{ node.dns_name }}:{{ patroni_port }}/config"
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    validate_certs: true
+    use_proxy: false
+    status_code: 200
+  register: active_policy
+
+- name: Require configured safety policy in the DCS
+  ansible.builtin.assert:
+    that:
+      - active_policy.json.ttl == cluster.replication.ttl
+      - active_policy.json.loop_wait == cluster.replication.loop_wait
+      - active_policy.json.retry_timeout == cluster.replication.retry_timeout
+      - active_policy.json.maximum_lag_on_failover == cluster.replication.maximum_lag_on_failover
+      - active_policy.json.synchronous_mode == (cluster.replication.mode == 'strict_sync')
+      - active_policy.json.synchronous_mode_strict == (cluster.replication.mode == 'strict_sync')
+      - active_policy.json.synchronous_node_count == cluster.replication.synchronous_node_count
+      - not active_policy.json.failsafe_mode
+      - active_policy.json.check_timeline
+      - not active_policy.json.postgresql.use_pg_rewind
+      - active_policy.json.postgresql.parameters.archive_command == postgres_archive_command
+      - not (active_policy.json.pause | default(false))
+
+- name: Check local role through Patroni
+  ansible.builtin.uri:
+    url: "https://{{ node.dns_name }}:{{ patroni_port }}/{{ 'primary' if inventory_hostname == current_primary else 'replica?lag=' ~ cluster.replication.read_lag_bytes }}"
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+    validate_certs: true
+    status_code: 200
+  register: local_role_health
+
+- name: Require a common current timeline and a functioning leader watchdog
+  ansible.builtin.assert:
+    that:
+      - local_role_health.json.timeline is defined
+      - local_role_health.json.timeline == hostvars[current_primary].local_role_health.json.timeline
+      - not (local_role_health.json.watchdog_failed | default(false))
+
+- name: Inspect local PostgreSQL system identity and recovery state
+  community.postgresql.postgresql_query:
+    login_unix_socket: /run/pg-ha-patroni
+    login_port: "{{ pg_port }}"
+    query: SELECT system_identifier::text, pg_is_in_recovery() AS recovery FROM pg_control_system()
+  become_user: postgres
+  register: sql_state
+
+- name: Check identical PostgreSQL system identifiers and actual role
+  ansible.builtin.assert:
+    that:
+      - sql_state.query_result[0].system_identifier == hostvars[current_primary].sql_state.query_result[0].system_identifier
+      - sql_state.query_result[0].recovery == (inventory_hostname != current_primary)
+
+- name: Inspect actual primary replication connections
+  community.postgresql.postgresql_query:
+    login_unix_socket: /run/pg-ha-patroni
+    login_port: "{{ pg_port }}"
+    query: SELECT application_name, state, sync_state, pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint AS lag FROM pg_stat_replication
+  become_user: postgres
+  register: replication_state
+  when: inventory_hostname == current_primary
+
+- name: Require streaming replicas and durability policy
+  ansible.builtin.assert:
+    that:
+      - replication_state.query_result | map(attribute='application_name') | sort == (groups['postgres_cluster'] | difference([current_primary]) | sort)
+      - replication_state.query_result | rejectattr('state', 'equalto', 'streaming') | list | length == 0
+      - cluster.replication.mode != 'strict_sync' or replication_state.query_result | selectattr('sync_state', 'equalto', 'sync') | list | length >= cluster.replication.synchronous_node_count
+  when: inventory_hostname == current_primary
+
+- name: Require finite, bounded replay lag
+  ansible.builtin.assert:
+    that:
+      - item.lag is not none
+      - item.lag | int >= 0
+      - item.lag | int <= cluster.replication.read_lag_bytes
+  loop: "{{ replication_state.query_result | default([]) }}"
+  when: inventory_hostname == current_primary
+
+- name: Query etcd membership and endpoint status
+  ansible.builtin.command:
+    argv: ['{{ etcd_binary_dir }}/etcdctl', '{{ item }}', '{{ "list" if item == "member" else "status" }}', --write-out=json]
+  environment:
+    ETCDCTL_API: '3'
+    ETCDCTL_ENDPOINTS: "https://{{ node.dns_name }}:{{ etcd_client_port }}"
+    ETCDCTL_CACERT: /etc/pg-ha/etcd/ca.pem
+    ETCDCTL_CERT: /etc/pg-ha/etcd/cert.pem
+    ETCDCTL_KEY: /etc/pg-ha/etcd/key.pem
+  changed_when: false
+  register: etcd_state
+  loop: [member, endpoint]
+  when: inventory_hostname in groups['etcd_cluster']
+
+- name: Require consensus-backed etcd endpoint health
+  ansible.builtin.command:
+    argv: ['{{ etcd_binary_dir }}/etcdctl', endpoint, health, --write-out=json]
+  environment:
+    ETCDCTL_API: '3'
+    ETCDCTL_ENDPOINTS: "https://{{ node.dns_name }}:{{ etcd_client_port }}"
+    ETCDCTL_CACERT: /etc/pg-ha/etcd/ca.pem
+    ETCDCTL_CERT: /etc/pg-ha/etcd/cert.pem
+    ETCDCTL_KEY: /etc/pg-ha/etcd/key.pem
+  changed_when: false
+  when: inventory_hostname in groups['etcd_cluster']
+
+- name: Require expected etcd names and no endpoint errors
+  ansible.builtin.assert:
+    that:
+      - (etcd_state.results[0].stdout | from_json).members | map(attribute='name') | sort == groups['etcd_cluster'] | sort
+      - (etcd_state.results[1].stdout | from_json)[0].Status.errors | default([]) | length == 0
+      - (etcd_state.results[1].stdout | from_json)[0].Status.leader | int > 0
+  when: inventory_hostname in groups['etcd_cluster']
+
+- name: Verify routing decision health on each router
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/pg-ha/check-vip]
+  changed_when: false
+  when: inventory_hostname in groups['routers']
+
+- name: Inspect VIP addresses on all nodes
+  ansible.builtin.command:
+    argv: [/usr/sbin/ip, '-j', '-4', address, show]
+  changed_when: false
+  register: vip_addresses
+  when: haproxy_enabled
+
+- name: Record local VIP ownership
+  ansible.builtin.set_fact:
+    owns_vip: "{{ cluster.vip in (vip_addresses.stdout | from_json | map(attribute='addr_info') | flatten | map(attribute='local') | list) }}"
+  when: haproxy_enabled
+
+- name: Require exactly one VIP owner in the reachable inventory
+  ansible.builtin.assert:
+    that:
+      - groups['postgres_cluster'] | map('extract', hostvars, 'owns_vip') | select('equalto', true) | list | length == 1
+    fail_msg: 'VIP owner count is not one. Inspect VRRP/network partitions before exposing clients.'
+  run_once: true
+  when: haproxy_enabled
+
+- name: Report health scope and outstanding application-side acceptance
+  ansible.builtin.debug:
+    msg: 'Membership, local SQL roles, replication and etcd status verified; routing and reachable-node VIP uniqueness checked when enabled. Application-network read/write and failure/restore acceptance must also pass.'

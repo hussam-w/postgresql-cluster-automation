@@ -1,0 +1,200 @@
+---
+- name: Qualify changed Patroni parameters in isolated local test services
+  hosts: "{{ qa_host | mandatory }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    qa_root: /srv/postgres/reconcile-patroni-qa-20260913-v2
+    qa_socket: /srv/postgres/reconcile-patroni-qa-20260913-v2/socket
+    qa_etcd_unit: pg-ha-reconcile-qa-etcd-v2.service
+    qa_patroni_unit: pg-ha-reconcile-qa-patroni-v2.service
+  tasks:
+    - name: Require protected production lineage before creating a test instance
+      ansible.builtin.assert:
+        that:
+          - qa_protected_system_id is defined
+          - qa_protected_system_id | string is match('^[0-9]+$')
+    - name: Require explicit creation of the isolated test cluster
+      ansible.builtin.assert:
+        that: reconcile_test_confirmation | default('') == 'CREATE ISOLATED PATRONI RECONCILIATION TEST'
+    - name: Inspect isolated root
+      ansible.builtin.stat:
+        path: '{{ qa_root }}'
+      register: qa_root_before
+    - name: Refuse existing test data
+      ansible.builtin.assert:
+        that: not qa_root_before.stat.exists
+    - name: Inspect transient test unit names
+      ansible.builtin.command:
+        argv: [systemctl, show, '{{ item }}', '-p', LoadState, '--value']
+      changed_when: false
+      failed_when: false
+      register: qa_units
+      loop: ['{{ qa_etcd_unit }}', '{{ qa_patroni_unit }}']
+    - name: Refuse to replace an existing unit
+      ansible.builtin.assert:
+        that: item.stdout | trim == 'not-found'
+      loop: '{{ qa_units.results }}'
+    - name: Require unused loopback test ports
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: '{{ item }}'
+        state: stopped
+        timeout: 1
+      loop: [62379, 62380, 58008, 55492]
+    - name: Create new private test directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      loop: ['{{ qa_root }}', '{{ qa_socket }}', '{{ qa_root }}/etcd']
+    - name: Create the isolated Patroni configuration
+      ansible.builtin.copy:
+        dest: '{{ qa_root }}/patroni.yml'
+        owner: postgres
+        group: postgres
+        mode: '0600'
+        force: false
+        content: |
+          scope: reconciliation_qa
+          name: qa
+          namespace: /reconciliation-qa/
+          restapi:
+            listen: 127.0.0.1:58008
+            connect_address: 127.0.0.1:58008
+          etcd3:
+            hosts: 127.0.0.1:62379
+          watchdog:
+            mode: 'off'
+          bootstrap:
+            dcs:
+              ttl: 20
+              loop_wait: 1
+              retry_timeout: 3
+              postgresql:
+                use_pg_rewind: false
+                parameters:
+                  max_connections: 10
+                  max_wal_senders: 2
+                  max_replication_slots: 2
+            initdb:
+              - auth-local: peer
+              - auth-host: scram-sha-256
+          postgresql:
+            listen: 127.0.0.1:55492
+            connect_address: 127.0.0.1:55492
+            data_dir: {{ qa_root }}/data
+            bin_dir: /usr/lib/postgresql/17/bin
+            use_unix_socket: true
+            authentication:
+              superuser:
+                username: postgres
+              replication:
+                username: qa_replicator
+            parameters:
+              unix_socket_directories: {{ qa_socket }}
+              shared_buffers: 32MB
+            pg_hba:
+              - local all postgres peer
+              - host all all 0.0.0.0/0 reject
+              - host all all ::/0 reject
+    - name: Qualify the DCS write and no-op path with guaranteed test shutdown
+      block:
+        - name: Start a separate loopback-only etcd process
+          ansible.builtin.command:
+            argv:
+              - systemd-run
+              - '--unit={{ qa_etcd_unit }}'
+              - '--property=User=postgres'
+              - '--property=Group=postgres'
+              - '--property=Restart=no'
+              - /opt/pg-ha/etcd/3.5.33/etcd
+              - --name=qa
+              - '--data-dir={{ qa_root }}/etcd'
+              - --listen-client-urls=http://127.0.0.1:62379
+              - --advertise-client-urls=http://127.0.0.1:62379
+              - --listen-peer-urls=http://127.0.0.1:62380
+              - --initial-advertise-peer-urls=http://127.0.0.1:62380
+              - --initial-cluster=qa=http://127.0.0.1:62380
+              - --quota-backend-bytes=67108864
+          register: qa_etcd_started
+        - name: Wait for the isolated etcd listener
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: 62379
+            timeout: 30
+        - name: Start the isolated Patroni process
+          ansible.builtin.command:
+            argv: [systemd-run, '--unit={{ qa_patroni_unit }}', '--property=User=postgres', '--property=Group=postgres', '--property=Restart=no', /usr/bin/patroni, '{{ qa_root }}/patroni.yml']
+          register: qa_patroni_started
+        - name: Wait for isolated primary readiness
+          ansible.builtin.uri:
+            url: http://127.0.0.1:58008/primary
+            use_proxy: false
+          register: qa_ready
+          until: qa_ready.status == 200
+          retries: 30
+          delay: 2
+        - name: Plan a native Patroni dynamic parameter change
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: 55492
+            manager: patroni
+            patroni_config: '{{ qa_root }}/patroni.yml'
+            parameters: {log_min_duration_statement: 500ms}
+          register: qa_plan
+        - name: Prove isolation from the production database lineage
+          ansible.builtin.assert:
+            that: qa_plan.report.identity.system_id != qa_protected_system_id
+        - name: Apply through the isolated Patroni DCS with native compare-and-swap
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: 55492
+            manager: patroni
+            patroni_config: '{{ qa_root }}/patroni.yml'
+            parameters: {log_min_duration_statement: 500ms}
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+            expected_plan_sha256: '{{ qa_plan.report.plan_sha256 }}'
+            allow_reload: true
+            operation: apply
+            backup_root: /var/lib/pg-ha-reconcile-patroni-qa
+          register: qa_apply
+        - name: Repeat the desired state without another DCS write
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: 55492
+            manager: patroni
+            patroni_config: '{{ qa_root }}/patroni.yml'
+            parameters: {log_min_duration_statement: 0.5s}
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+            allow_reload: true
+            operation: apply
+            backup_root: /var/lib/pg-ha-reconcile-patroni-qa
+          register: qa_repeat
+        - name: Verify native convergence and repeat-run idempotency
+          ansible.builtin.assert:
+            that:
+              - qa_apply.changed
+              - not qa_repeat.changed
+              - qa_plan.report.identity.started == qa_repeat.report.identity.started
+      always:
+        - name: Stop only the newly created isolated Patroni unit
+          ansible.builtin.systemd_service:
+            name: '{{ qa_patroni_unit }}'
+            state: stopped
+          when: qa_patroni_started is defined and qa_patroni_started.rc == 0
+        - name: Stop only the newly created isolated etcd unit
+          ansible.builtin.systemd_service:
+            name: '{{ qa_etcd_unit }}'
+            state: stopped
+          when: qa_etcd_started is defined and qa_etcd_started.rc == 0
+        - name: Require isolated ports to be closed after shutdown
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: '{{ item }}'
+            state: stopped
+            timeout: 30
+          loop: [62379, 62380, 58008, 55492]

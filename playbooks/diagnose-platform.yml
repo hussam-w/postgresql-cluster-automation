@@ -1,0 +1,47 @@
+---
+- name: Inspect live deployment without changing services
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read current Patroni timeline and role
+      ansible.builtin.uri:
+        url: "https://{{ node.dns_name }}:{{ cluster.ports.patroni }}/patroni"
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+        return_content: true
+      register: role_diagnostic
+    - name: Report nonsecret current role and timeline
+      ansible.builtin.debug:
+        var: role_diagnostic.json
+    - name: Inspect authentication policy without exposing password verifiers
+      community.postgresql.postgresql_query:
+        login_unix_socket: /run/pg-ha-patroni
+        login_port: "{{ cluster.ports.postgres | default(5432) }}"
+        query: "SELECT rolname, left(rolpassword, 14) = 'SCRAM-SHA-256$' AS scram, length(rolpassword) AS verifier_length, current_setting('password_encryption') AS encryption FROM pg_authid WHERE rolname = %s"
+        positional_args:
+          - "{{ item }}"
+      loop: "{{ application_databases | map(attribute='owner') | unique | list }}"
+      become_user: postgres
+      register: auth_policy
+    - name: Report only nonsecret authentication type
+      ansible.builtin.debug:
+        msg: "{{ auth_policy.results | map(attribute='query_result') | flatten }}"
+    - name: Inspect updater status and recent progress
+      ansible.builtin.command:
+        argv: '{{ item }}'
+      changed_when: false
+      failed_when: false
+      register: diagnostic
+      loop:
+        - [uname, -r]
+        - [systemctl, status, systemd-modules-load, --no-pager]
+        - [journalctl, -b, -u, systemd-modules-load, --no-pager]
+        - [timedatectl, show, --property=NTPSynchronized]
+        - [ls, -l, /dev/watchdog, /dev/watchdog0]
+        - [cat, /etc/modules-load.d/pg-ha-watchdog.conf]
+    - name: Report read-only maintenance observations
+      ansible.builtin.debug:
+        msg: '{{ diagnostic.results | map(attribute="stdout") | list }}'

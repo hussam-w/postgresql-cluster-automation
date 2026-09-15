@@ -1,0 +1,122 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: ip-migration-service-certificates
+
+- name: Complete IP SAN migration for application and management TLS
+  hosts: postgres_cluster
+  serial: 1
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    deployment_mode: verify
+  roles: [common]
+  tasks:
+    - name: Validate existing managed baseline before changing certificates
+      ansible.builtin.include_role:
+        name: health
+        tasks_from: integrity.yml
+    - name: Install same-key service certificates with actual IP and retained DNS identities
+      ansible.builtin.copy:
+        src: '{{ migration_certificate_dir }}/{{ inventory_hostname }}-{{ item.service }}.pem'
+        dest: '/etc/pg-ha/{{ item.service }}/cert.pem'
+        owner: '{{ item.owner }}'
+        group: '{{ item.owner }}'
+        mode: '0640'
+        backup: true
+      loop:
+        - {service: postgres, owner: postgres}
+        - {service: patroni, owner: postgres}
+        - {service: pgbouncer, owner: pgbouncer}
+        - {service: haproxy, owner: root}
+    - name: Install the backup leaf with unchanged CN authorization and key
+      ansible.builtin.copy:
+        src: '{{ migration_certificate_dir }}/{{ inventory_hostname }}-backup.pem'
+        dest: /etc/pgbackrest/cert.pem
+        owner: postgres
+        group: postgres
+        mode: '0600'
+        backup: true
+    - name: Reassemble only the HAProxy client certificate bundle
+      ansible.builtin.copy:
+        content: "{{ lookup('file', migration_certificate_dir ~ '/' ~ inventory_hostname ~ '-haproxy.pem') ~ '\n' ~ lookup('file', tls_sources.haproxy.key) ~ '\n' }}"
+        dest: /etc/pg-ha/haproxy/client.pem
+        owner: root
+        group: root
+        mode: '0600'
+        backup: true
+      no_log: true
+      diff: false
+    - name: Validate service key pairing, purposes and trust separation
+      cluster_tls_check:
+        core: true
+    - name: Require node IP identity on every migrated service certificate
+      ansible.builtin.command:
+        argv: [openssl, verify, -CAfile, '/etc/pg-ha/{{ item }}/ca.pem', -verify_ip, '{{ node.address }}', '/etc/pg-ha/{{ item }}/cert.pem']
+      loop: [postgres, patroni, pgbouncer, haproxy]
+      changed_when: false
+    - name: Preserve verified client VIP identity
+      ansible.builtin.command:
+        argv: [openssl, verify, -CAfile, /etc/pg-ha/pgbouncer/ca.pem, -verify_ip, '{{ cluster.vip }}', /etc/pg-ha/pgbouncer/cert.pem]
+      changed_when: false
+    - name: Reload PostgreSQL TLS without stopping database sessions
+      community.postgresql.postgresql_query:
+        login_unix_socket: /run/pg-ha-patroni
+        login_port: 5432
+        login_db: postgres
+        query: SELECT pg_reload_conf()
+      become_user: postgres
+    - name: Reload TLS-aware services without database restart
+      ansible.builtin.systemd_service:
+        name: '{{ item }}'
+        state: reloaded
+      loop: [pg-ha-patroni, pg-ha-pgbouncer, pg-ha-haproxy]
+    - name: Refresh backup TLS server
+      ansible.builtin.systemd_service:
+        name: pg-ha-backup
+        state: restarted
+    - name: Verify HTTPS management directly through actual node IP
+      ansible.builtin.uri:
+        url: 'https://{{ node.address }}:8008/patroni'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+      register: ip_certificate_api
+      retries: 10
+      delay: 2
+      until: ip_certificate_api.status == 200
+    - name: Verify PostgreSQL and pooler through actual IP with full TLS verification
+      community.postgresql.postgresql_query:
+        login_host: '{{ node.address }}'
+        login_port: '{{ item }}'
+        login_db: '{{ application_databases[0].name }}'
+        login_user: '{{ application_databases[0].owner }}'
+        login_password: '{{ (vault_app_users | selectattr("name", "equalto", application_databases[0].owner) | first).password }}'
+        ssl_mode: verify-full
+        ca_cert: /etc/pg-ha/postgres/ca.pem
+        query: SELECT pg_is_in_recovery()
+      loop: [5432, 6432]
+      no_log: true
+    - name: Inspect only reviewed certificate and bundle fingerprints
+      ansible.builtin.stat:
+        path: '{{ item }}'
+        checksum_algorithm: sha256
+      loop: [/etc/pg-ha/postgres/cert.pem, /etc/pg-ha/patroni/cert.pem, /etc/pg-ha/pgbouncer/cert.pem, /etc/pg-ha/haproxy/cert.pem, /etc/pg-ha/haproxy/client.pem]
+      register: service_certificates
+    - name: Update only the changed certificate entries
+      ansible.builtin.set_fact:
+        managed_fingerprint: "{{ managed_fingerprint | combine({item.item: {'sha256': item.stat.checksum, 'uid': item.stat.uid, 'gid': item.stat.gid, 'mode': item.stat.mode}}) }}"
+      loop: '{{ service_certificates.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+    - name: Persist the reviewed certificate baseline after functional TLS checks
+      ansible.builtin.copy:
+        backup: true
+        content: '{{ managed_fingerprint | to_nice_json }}'
+        dest: /var/lib/pg-ha/files.json
+        owner: root
+        group: root
+        mode: '0600'

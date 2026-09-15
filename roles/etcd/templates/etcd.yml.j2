@@ -1,0 +1,25 @@
+name: {{ inventory_hostname | to_json }}
+data-dir: {{ cluster.etcd_data_dir | to_json }}
+listen-peer-urls: {{ ('https://' ~ node.address ~ ':' ~ etcd_peer_port) | to_json }}
+listen-client-urls: {{ ('https://' ~ node.address ~ ':' ~ etcd_client_port) | to_json }}
+initial-advertise-peer-urls: {{ ('https://' ~ node.dns_name ~ ':' ~ etcd_peer_port) | to_json }}
+advertise-client-urls: {{ ('https://' ~ node.dns_name ~ ':' ~ etcd_client_port) | to_json }}
+initial-cluster: "{% for host in groups['etcd_cluster'] %}{{ host }}=https://{{ hostvars[host].node.dns_name }}:{{ etcd_peer_port }}{{ ',' if not loop.last else '' }}{% endfor %}"
+initial-cluster-token: {{ cluster.etcd_token | to_json }}
+initial-cluster-state: new
+heartbeat-interval: {{ cluster.etcd.heartbeat_ms }}
+election-timeout: {{ cluster.etcd.election_ms }}
+quota-backend-bytes: {{ cluster.etcd.quota_bytes }}
+auto-compaction-mode: periodic
+auto-compaction-retention: '1h'
+tls-min-version: TLS1.2
+client-transport-security:
+  cert-file: /etc/pg-ha/etcd/cert.pem
+  key-file: /etc/pg-ha/etcd/key.pem
+  client-cert-auth: true
+  trusted-ca-file: /etc/pg-ha/etcd/ca.pem
+peer-transport-security:
+  cert-file: /etc/pg-ha/etcd/cert.pem
+  key-file: /etc/pg-ha/etcd/key.pem
+  client-cert-auth: true
+  trusted-ca-file: /etc/pg-ha/etcd/ca.pem

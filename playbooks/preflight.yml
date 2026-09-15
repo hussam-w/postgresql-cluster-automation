@@ -1,0 +1,12 @@
+---
+- name: Validate controller-side inputs
+  ansible.builtin.import_playbook: validate-inputs.yml
+
+- name: Read-only environment audit
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  vars:
+    deployment_mode: audit
+  roles: [common, preflight]

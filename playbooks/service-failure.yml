@@ -1,0 +1,51 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: service-failure
+
+- name: Exercise one service failure with guaranteed recovery attempt
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require one explicitly selected failure and a bounded recovery window
+      ansible.builtin.assert:
+        that:
+          - failure_test_confirmation | default('') == 'TEST SINGLE SERVICE FAILURE'
+          - failure_host in groups['postgres_cluster']
+          - failure_service in ['pg-ha-haproxy', 'pg-ha-pgbouncer', 'pg-ha-etcd', 'pg-ha-keepalived', 'pg-ha-patroni']
+          - failure_hold_seconds | int >= 5
+          - failure_hold_seconds | int <= 90
+      run_once: true
+    - name: Record initial service state
+      ansible.builtin.command:
+        argv: [systemctl, is-active, '{{ failure_service }}']
+      changed_when: false
+      when: inventory_hostname == failure_host
+    - name: Stop a single service and allow recovery mechanisms to operate
+      when: inventory_hostname == failure_host
+      block:
+        - name: Stop only the selected service
+          ansible.builtin.systemd_service:
+            name: '{{ failure_service }}'
+            state: stopped
+        - name: Observe the bounded failure interval
+          ansible.builtin.wait_for:
+            timeout: '{{ failure_hold_seconds | int }}'
+          delegate_to: localhost
+          become: false
+      always:
+        - name: Restore the selected service even if the experiment fails
+          ansible.builtin.systemd_service:
+            name: '{{ failure_service }}'
+            state: started
+        - name: Require service recovery
+          ansible.builtin.command:
+            argv: [systemctl, is-active, '{{ failure_service }}']
+          changed_when: false
+          register: recovered_service
+          retries: 30
+          delay: 2
+          until: recovered_service.rc == 0

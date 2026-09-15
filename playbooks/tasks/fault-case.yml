@@ -1,0 +1,59 @@
+---
+- name: Capture the primary before this experiment
+  ansible.builtin.set_fact:
+    fault_primary_before: '{{ current_primary }}'
+- name: Select the current VIP owner or primary from verified runtime state
+  ansible.builtin.set_fact:
+    fault_target: "{{ (groups['routers'] | map('extract', hostvars) | selectattr('owns_vip', 'equalto', true) | map(attribute='inventory_hostname') | first) if fault_case.target == 'vip' else current_primary }}"
+- name: Record the bounded failure being exercised
+  ansible.builtin.debug:
+    msg: 'Stop {{ fault_case.service }} on {{ fault_target }} for 20 seconds, restore it, then verify all nodes.'
+  run_once: true
+- name: Inject one recoverable service outage
+  when: inventory_hostname == fault_target
+  block:
+    - name: Stop the selected component
+      ansible.builtin.systemd_service:
+        name: '{{ fault_case.service }}'
+        state: stopped
+    - name: Allow HA mechanisms to operate during the bounded outage
+      ansible.builtin.wait_for:
+        timeout: 20
+      delegate_to: localhost
+      become: false
+  always:
+    - name: Restore the selected component before any later experiment
+      ansible.builtin.systemd_service:
+        name: '{{ fault_case.service }}'
+        state: started
+- name: Wait for every node to return to a running database state
+  ansible.builtin.uri:
+    url: 'https://{{ node.dns_name }}:{{ patroni_port }}/patroni'
+    ca_path: /etc/pg-ha/patroni/ca.pem
+    client_cert: /etc/pg-ha/patroni/cert.pem
+    client_key: /etc/pg-ha/patroni/key.pem
+    use_proxy: false
+  register: fault_recovery
+  retries: 45
+  delay: 2
+  until: fault_recovery.status == 200 and fault_recovery.json.state == 'running' and fault_recovery.json.timeline is not none
+- name: Wait for role-aware routing to stabilize
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/pg-ha/check-vip]
+  changed_when: false
+  register: fault_routing
+  retries: 30
+  delay: 2
+  until: fault_routing.rc == 0
+- name: Verify all identities, replication and routing before another failure
+  ansible.builtin.include_role:
+    name: health
+- name: Record recovered service failure evidence
+  ansible.builtin.copy:
+    backup: true
+    content: "{{ {'service': fault_case.service, 'host': fault_target, 'hold_seconds': 20, 'primary_before': fault_primary_before, 'primary_after': current_primary, 'complete_health_verified': true} | to_nice_json }}"
+    dest: '{{ playbook_dir }}/../artifacts/fault-{{ fault_case.service }}.json'
+    mode: '0600'
+  delegate_to: localhost
+  become: false
+  run_once: true

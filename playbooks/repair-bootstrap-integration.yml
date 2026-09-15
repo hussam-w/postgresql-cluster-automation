@@ -1,0 +1,103 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: repair-bootstrap-integration
+
+- name: Validate exact partial deployment before correcting integration
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  roles: [common, preflight]
+  tasks:
+    - name: Restrict this repair to the recorded incomplete bootstrap
+      ansible.builtin.assert:
+        that: deployment_mode == 'resume'
+
+- name: Reload local replication probe configuration one node at a time
+  hosts: postgres_cluster
+  serial: 1
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Validate corrected Patroni candidate before installation
+      ansible.builtin.template:
+        src: '{{ playbook_dir }}/../roles/patroni/templates/patroni.yml.j2'
+        dest: /etc/pg-ha/patroni/patroni.yml
+        owner: postgres
+        group: postgres
+        mode: '0600'
+        backup: true
+        validate: /usr/bin/patroni --validate-config --ignore-listen-port %s
+      no_log: true
+      diff: false
+      register: patroni_candidate
+      failed_when: false
+    - name: Report validation failure with known credentials redacted
+      ansible.builtin.assert:
+        that: patroni_candidate.msg is not defined
+        fail_msg: "{{ ((patroni_candidate.msg | default('')) ~ ' ' ~ (patroni_candidate.stderr | default('')) ~ ' ' ~ (patroni_candidate.stdout | default(''))) | replace(vault_pg_superuser_password, '[redacted]') | replace(vault_pg_replication_password, '[redacted]') | replace(vault_patroni_api_password, '[redacted]') }}"
+    - name: Reload Patroni without restarting PostgreSQL
+      ansible.builtin.command:
+        argv: [systemctl, kill, --kill-who=main, --signal=HUP, pg-ha-patroni]
+      when: patroni_candidate.changed
+    - name: Require actual timeline visibility after authenticated local probe repair
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:{{ patroni_port }}/patroni'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+      register: repaired_role
+      retries: 20
+      delay: 2
+      until: repaired_role.status == 200 and repaired_role.json.timeline is not none
+
+- name: Correct only the reloadable WAL archive command in Patroni dynamic policy
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Read existing dynamic policy
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:{{ patroni_port }}/config'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        use_proxy: false
+      register: archive_policy
+      run_once: true
+    - name: Reject an unrelated archive configuration
+      ansible.builtin.assert:
+        that: archive_policy.json.postgresql.parameters.archive_command in [cluster.backup.archive_executable ~ ' %p %f', postgres_archive_command]
+      run_once: true
+    - name: Patch only archive_command through authenticated Patroni management
+      ansible.builtin.uri:
+        url: 'https://{{ node.dns_name }}:{{ patroni_port }}/config'
+        method: PATCH
+        body_format: json
+        body:
+          postgresql:
+            parameters:
+              archive_command: '{{ postgres_archive_command }}'
+        ca_path: /etc/pg-ha/patroni/ca.pem
+        client_cert: /etc/pg-ha/patroni/cert.pem
+        client_key: /etc/pg-ha/patroni/key.pem
+        url_username: operator
+        url_password: '{{ vault_patroni_api_password }}'
+        force_basic_auth: true
+        use_proxy: false
+        status_code: 200
+      run_once: true
+      no_log: true
+      when: archive_policy.json.postgresql.parameters.archive_command != postgres_archive_command
+
+- name: Finish and validate the recorded deployment
+  ansible.builtin.import_playbook: site.yml
+- name: Verify application traffic and encrypted backup
+  ansible.builtin.import_playbook: data-acceptance.yml

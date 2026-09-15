@@ -1,0 +1,27 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: service-failure-acceptance
+
+- name: Verify a healthy baseline before fault injection
+  ansible.builtin.import_playbook: verify.yml
+- name: Exercise one bounded service failure
+  ansible.builtin.import_playbook: service-failure.yml
+- name: Wait for normal role routing after restoration
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require usable role-aware backends
+      ansible.builtin.command:
+        argv: [/usr/local/libexec/pg-ha/check-vip]
+      changed_when: false
+      register: routing_recovered
+      retries: 45
+      delay: 2
+      until: routing_recovered.rc == 0
+- name: Verify all identities and replication after the failure
+  ansible.builtin.import_playbook: verify.yml
+- name: Verify read and write semantics after recovery
+  ansible.builtin.import_playbook: endpoints-verify.yml

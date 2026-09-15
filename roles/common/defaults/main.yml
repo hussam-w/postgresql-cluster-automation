@@ -1,0 +1,19 @@
+---
+deployment_mode: audit
+bootstrap_confirmation: ''
+pg_port: "{{ cluster.ports.postgres | default(5432) }}"
+pool_port: "{{ cluster.ports.pgbouncer | default(6432) }}"
+patroni_port: "{{ cluster.ports.patroni | default(8008) }}"
+etcd_client_port: "{{ cluster.ports.etcd_client | default(2379) }}"
+etcd_peer_port: "{{ cluster.ports.etcd_peer | default(2380) }}"
+write_port: "{{ cluster.ports.write | default(5000) }}"
+read_port: "{{ cluster.ports.read | default(5001) }}"
+config_root: /etc/pg-ha
+state_root: /var/lib/pg-ha
+# Model selects the major; legacy inventories derive it from their exact package pins.
+postgresql_major: "{{ (postgresql_deployment | default({})) | postgres_major((cluster | default({})).get('packages', {})) }}"
+binary_dir: "/usr/lib/postgresql/{{ postgresql_major }}/bin"
+etcd_binary_dir: "/opt/pg-ha/etcd/{{ cluster.expected_versions.etcd }}"
+haproxy_enabled: "{{ cluster.get('components', {}).get('haproxy', true) }}"
+wal_archive_enabled: "{{ cluster.get('components', {}).get('wal_archive', true) }}"
+postgres_archive_command: "{{ ('/usr/bin/pgbackrest --stanza=' ~ cluster.name ~ ' archive-push %p' if backup_repository_host is defined else cluster.backup.archive_executable ~ ' %p %f') if wal_archive_enabled else '' }}"

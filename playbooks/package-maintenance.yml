@@ -1,0 +1,28 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: package-maintenance
+
+- name: Obtain a clean package-manager handoff from background updates
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Request graceful cancellation of minimal-step unattended updates
+      package_maintenance:
+        cancel_updater: true
+        cancel_stalled_downloads: "{{ cancel_stalled_package_downloads | default(false) }}"
+    - name: Wait for normal package-lock release without removing lock files
+      package_maintenance:
+      register: package_locks
+      until: package_locks.locks_held | length == 0
+      retries: 60
+      delay: 5
+    - name: Require a consistent dpkg database before deployment
+      ansible.builtin.command:
+        argv: [dpkg, --audit]
+      register: dpkg_audit
+      changed_when: false
+      failed_when: dpkg_audit.rc != 0 or dpkg_audit.stdout | trim | length > 0

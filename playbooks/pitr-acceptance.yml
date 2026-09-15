@@ -1,0 +1,77 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: pitr-acceptance
+
+- name: Create temporal recovery markers and archive their WAL
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Validate isolated temporal test table identifier
+      ansible.builtin.assert:
+        that: pitr_table | default('pg_ha_pitr_acceptance') is match('^pg_ha_pitr_acceptance(_[a-z0-9]+)?$')
+      run_once: true
+    - name: Commit the marker that must exist at the selected recovery point
+      community.postgresql.postgresql_query:
+        login_host: '{{ cluster.vip_dns_name }}'
+        login_port: '{{ write_port }}'
+        login_db: '{{ application_databases[0].name }}'
+        login_user: '{{ application_databases[0].owner }}'
+        login_password: "{{ (vault_app_users | selectattr('name', 'equalto', application_databases[0].owner) | first).password }}"
+        ssl_mode: verify-full
+        ca_cert: /etc/pg-ha/postgres/ca.pem
+        query:
+          - "CREATE TABLE public.{{ pitr_table | default('pg_ha_pitr_acceptance') }} (id integer PRIMARY KEY)"
+          - "INSERT INTO public.{{ pitr_table | default('pg_ha_pitr_acceptance') }} VALUES (1)"
+      run_once: true
+      no_log: true
+    - name: Capture database wall clock after the first transaction committed
+      community.postgresql.postgresql_query:
+        login_unix_socket: /run/pg-ha-patroni
+        login_port: '{{ pg_port }}'
+        login_db: postgres
+        query: "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00' AS target_time"
+      become_user: postgres
+      register: pitr_clock
+      run_once: true
+    - name: Make the before and after transactions clearly distinct in time
+      ansible.builtin.wait_for:
+        timeout: 2
+      run_once: true
+    - name: Commit the marker that must not exist in the recovered database
+      community.postgresql.postgresql_query:
+        login_host: '{{ cluster.vip_dns_name }}'
+        login_port: '{{ write_port }}'
+        login_db: '{{ application_databases[0].name }}'
+        login_user: '{{ application_databases[0].owner }}'
+        login_password: "{{ (vault_app_users | selectattr('name', 'equalto', application_databases[0].owner) | first).password }}"
+        ssl_mode: verify-full
+        ca_cert: /etc/pg-ha/postgres/ca.pem
+        query: "INSERT INTO public.{{ pitr_table | default('pg_ha_pitr_acceptance') }} VALUES (2)"
+      run_once: true
+      no_log: true
+    - name: Require completed archiving before recovery
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', check]
+      become_user: postgres
+      when: inventory_hostname == backup_repository_host
+      changed_when: false
+    - name: Carry the measured recovery point into the isolated restore
+      ansible.builtin.set_fact:
+        restore_recovery_type: time
+        restore_target_time: '{{ pitr_clock.query_result[0].target_time }}'
+    - name: Preserve the nonsecret temporal target before testing recovery
+      ansible.builtin.copy:
+        backup: true
+        content: "{{ {'restore_target_time': restore_target_time, 'restore_recovery_type': 'time', 'pitr_table': pitr_table | default('pg_ha_pitr_acceptance')} | to_nice_json }}"
+        dest: '{{ playbook_dir }}/../artifacts/pitr-target.json'
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      run_once: true
+- name: Prove the target-time boundary on independently recovered data
+  ansible.builtin.import_playbook: restore-verify.yml

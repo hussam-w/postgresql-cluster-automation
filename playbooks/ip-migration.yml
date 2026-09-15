@@ -1,0 +1,175 @@
+---
+- name: Require explicit scope before legacy changes
+  ansible.builtin.import_playbook: maintenance-gate.yml
+  vars:
+    guarded_operation: ip-migration
+
+- name: Validate the scoped address migration and prepare protected recovery material
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Require exact supported topology and explicit migration phase
+      ansible.builtin.assert:
+        that:
+          - migration_confirmation == 'MIGRATE ' ~ cluster.name ~ ' TO VM ADDRESSES'
+          - migration_phase in ['prepare', 'bridge', 'dns', 'final', 'cleanup', 'commit']
+          - groups['postgres_cluster'] | sort == migration_nodes.keys() | list | sort
+          - ansible_play_hosts_all | sort == groups['postgres_cluster'] | sort
+          - migration_nodes | length == 3
+          - migration_state_dir is match('^/var/lib/pg-ha-migrations/[A-Za-z0-9_-]+$')
+          - migration_nodes[inventory_hostname].old == node.address
+          - migration_nodes[inventory_hostname].new == ansible_host
+          - migration_site_qualified | default(false) | bool
+          - cluster.ports.postgres == 5432 and cluster.ports.patroni == 8008
+          - cluster.ports.etcd_client == 2379 and cluster.ports.etcd_peer == 2380
+    - name: Install reviewed nonsecret migration identities
+      ansible.builtin.copy:
+        content: "{{ {'nodes': migration_nodes, 'state_dir': migration_state_dir} | to_nice_json }}"
+        dest: /etc/pg-ha/ip-migration.json
+        owner: root
+        group: root
+        mode: '0600'
+        backup: true
+    - name: Install scoped migration helper
+      ansible.builtin.copy:
+        backup: true
+        src: '{{ playbook_dir }}/../tools/ip_migration_node.py'
+        dest: /usr/local/libexec/pg-ha/ip-migration
+        owner: root
+        group: root
+        mode: '0700'
+    - name: Capture original files without overwriting prior snapshots
+      ansible.builtin.command:
+        argv: [/usr/local/libexec/pg-ha/ip-migration, snapshot]
+      when: migration_phase == 'prepare'
+    - name: Take a fresh encrypted backup before service migration
+      ansible.builtin.command:
+        argv: [pgbackrest, '--stanza={{ cluster.name }}', --type=full, backup]
+      become_user: postgres
+      when: migration_phase == 'prepare' and inventory_hostname == backup_repository_host
+    - name: Snapshot live consensus without modifying membership
+      ansible.builtin.command:
+        argv: ['{{ etcd_binary_dir }}/etcdctl', '--endpoints=https://{{ node.dns_name }}:2379', --cacert=/etc/pg-ha/etcd/ca.pem, --cert=/etc/pg-ha/etcd/cert.pem, --key=/etc/pg-ha/etcd/key.pem, snapshot, save, '{{ migration_state_dir }}/etcd.snapshot']
+      when: migration_phase == 'prepare' and inventory_hostname == groups.etcd_cluster[0]
+    - name: Require new IP authorization in DCS certificates before moving peer traffic
+      ansible.builtin.command:
+        argv: [openssl, verify, -CAfile, '/etc/pg-ha/{{ item }}/ca.pem', -verify_ip, '{{ ansible_host }}', '/etc/pg-ha/{{ item }}/cert.pem']
+      loop: [etcd, dcs]
+      changed_when: false
+      when: migration_phase in ['dns', 'final', 'cleanup']
+    - name: Stage guarded transition configurations
+      ansible.builtin.command:
+        argv: [/usr/local/libexec/pg-ha/ip-migration, '{{ migration_phase }}']
+      when: migration_phase in ['bridge', 'dns']
+    - name: Admit both exact peer address sets during transition
+      ansible.builtin.command:
+        argv: [nft, --file, /var/lib/pg-ha-platform/firewall.nft]
+      when: migration_phase == 'bridge'
+    - name: Select the requested source IP for each new peer address
+      ansible.builtin.command:
+        argv: [ip, route, replace, '{{ hostvars[item].ansible_host }}/32', dev, '{{ node.interface }}', src, '{{ ansible_host }}']
+      loop: '{{ groups.postgres_cluster | difference([inventory_hostname]) }}'
+      when: migration_phase == 'dns'
+
+- name: Roll services one node at a time while preserving cluster authority
+  hosts: postgres_cluster
+  gather_facts: false
+  serial: 1
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Apply one-node service migration and verify rejoin
+      ansible.builtin.include_tasks: tasks/ip-migration-roll.yml
+      when: migration_phase in ['bridge', 'final']
+
+- name: Final address removal with network recovery and recorded policy migration
+  hosts: postgres_cluster
+  gather_facts: false
+  serial: 1
+  become: true
+  any_errors_fatal: true
+  roles: [common]
+  tasks:
+    - name: Remove legacy addresses only after services use actual VM IPs
+      when: migration_phase == 'cleanup'
+      block:
+        - name: Require the Patroni HTTP gateway, not only native gRPC, before retiring aliases
+          ansible.builtin.uri:
+            url: 'https://{{ node.dns_name }}:2379/v3/cluster/member/list'
+            method: POST
+            body_format: json
+            body: {}
+            ca_path: /etc/pg-ha/dcs/ca.pem
+            client_cert: /etc/pg-ha/dcs/cert.pem
+            client_key: /etc/pg-ha/dcs/key.pem
+            use_proxy: false
+            timeout: 5
+        - name: Install network recovery script
+          ansible.builtin.copy:
+            backup: true
+            content: |
+              #!/bin/sh
+              set -eu
+              cp {{ migration_state_dir }}/etc/netplan/90-pg-ha-service.yaml /etc/netplan/90-pg-ha-service.yaml
+              /usr/sbin/netplan apply
+            dest: '{{ migration_state_dir }}/rollback-network'
+            mode: '0700'
+        - name: Schedule bounded network fallback
+          ansible.builtin.command:
+            argv: [systemd-run, --unit=pg-ha-ip-migration-rollback, --on-active=180s, '{{ migration_state_dir }}/rollback-network']
+        - name: Stage final persistent address and peer firewall policy
+          ansible.builtin.command:
+            argv: [/usr/local/libexec/pg-ha/ip-migration, cleanup]
+        - name: Validate combined persistent network
+          ansible.builtin.command:
+            argv: [netplan, generate]
+        - name: Apply persistent VM address configuration
+          ansible.builtin.command:
+            argv: [netplan, apply]
+        - name: Apply final exact peer policy
+          ansible.builtin.command:
+            argv: [nft, --file, /var/lib/pg-ha-platform/firewall.nft]
+        - name: Retire legacy VRRP peer entries after every router moved
+          ansible.builtin.systemd_service:
+            name: pg-ha-keepalived
+            state: restarted
+        - name: Close old controller SSH transport
+          ansible.builtin.meta: reset_connection
+        - name: Verify fresh management access
+          ansible.builtin.wait_for_connection:
+            timeout: 60
+        - name: Confirm actual VM IP and absence of legacy service IP
+          ansible.builtin.command:
+            argv: [ip, -j, -4, address, show, dev, '{{ node.interface }}']
+          register: migrated_addresses
+          failed_when: ansible_host not in migrated_addresses.stdout or node.address in migrated_addresses.stdout
+          changed_when: false
+        - name: Confirm role-aware routing is usable
+          ansible.builtin.command:
+            argv: [/usr/local/libexec/pg-ha/check-vip]
+          changed_when: false
+        - name: Cancel network fallback after successful acceptance
+          ansible.builtin.systemd_service:
+            name: pg-ha-ip-migration-rollback.timer
+            state: stopped
+    - name: Advance only verified address-related fingerprints
+      when: migration_phase == 'commit'
+      block:
+        - name: Read effective normalized firewall fingerprint
+          firewall_policy_info:
+          register: migration_firewall
+        - name: Validate protected phase manifest and migrate reviewed baseline
+          ansible.builtin.command:
+            argv: [/usr/local/libexec/pg-ha/ip-migration, commit, --firewall-sha, '{{ migration_firewall.sha256 }}']
+        - name: Record nonsecret migrated node values on controller
+          ansible.builtin.copy:
+            backup: true
+            content: "{{ {'node': node | combine({'address': ansible_host, 'firewall_sha256': migration_firewall.sha256})} | to_nice_yaml }}"
+            dest: '{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/platform.yml'
+            mode: '0600'
+          delegate_to: localhost
+          become: false

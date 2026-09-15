@@ -1,0 +1,18 @@
+---
+# Generic three-core topology; match these labels to your inventory. Observation only.
+# Change this one major selection; provide matching exact package pins.
+postgresql_version: '17'
+postgresql_deployment:
+  mode: cluster
+  architecture: type_a
+  major: '{{ postgresql_version }}'
+  topology:
+    primary: pg2
+    replicas: []
+    standby: [pg1, pg3]
+    total_nodes: 3
+    replica_count: 0
+    standby_count: 2
+  extensions: []
+  extension_databases: [postgres]
+postgresql_operation: plan

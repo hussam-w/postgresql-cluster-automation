@@ -1,0 +1,73 @@
+---
+- name: Admit the discovery inventory without requiring a deployment architecture
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require the discovery target group before inspecting individual hosts
+      ansible.builtin.assert:
+        that: groups.get('target_vms', []) | length > 0
+        fail_msg: 'Use an explicit discovery inventory based on examples/discovery-inventory.yml; target_vms is required.'
+
+    - name: Require the complete supplied management target set and an explicit SSH port
+      ansible.builtin.assert:
+        that:
+          - groups.get('target_vms', []) | length == hostvars[item].discovery_expected_management_ips | length
+          - groups['target_vms'] | map('extract', hostvars, 'management_ip') | sort == hostvars[item].discovery_expected_management_ips | sort
+          - hostvars[item].ansible_host == hostvars[item].management_ip
+          - hostvars[item].ansible_user is string
+          - hostvars[item].ansible_user | length > 0
+          - hostvars[item].discovery_ssh_port is integer
+          - hostvars[item].discovery_ssh_port | int > 0
+          - hostvars[item].discovery_ssh_port | int < 65536
+          - hostvars[item].ssh_authentication_method == 'password'
+        fail_msg: 'Supply a confirmed integer discovery_ssh_port and the complete target_vms inventory. Cluster roles remain unknown.'
+      loop: "{{ groups.get('target_vms', []) }}"
+
+    - name: Record successful input admission for the remote phase
+      ansible.builtin.set_fact:
+        discovery_inputs_validated: true
+
+- name: Collect non-destructive infrastructure observations from all selected VMs
+  hosts: target_vms
+  gather_facts: false
+  become: "{{ discovery_privileged | bool }}"
+  strategy: linear
+  roles:
+    - role: discovery
+      when: hostvars['localhost'].discovery_inputs_validated | default(false)
+
+- name: Write a private controller report including failed or unreachable targets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Create ignored local report directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../artifacts/discovery"
+        state: directory
+        mode: '0700'
+
+    - name: Save only the allowlisted discovery observations
+      ansible.builtin.template:
+        backup: true
+        src: "{{ playbook_dir }}/../roles/discovery/templates/report.json.j2"
+        dest: "{{ playbook_dir }}/../artifacts/discovery/report.json"
+        mode: '0600'
+
+    - name: Report observation coverage without implying deployment approval
+      ansible.builtin.debug:
+        msg: 'Report: artifacts/discovery/report.json. No component was installed, configured, stopped, restarted, initialized or removed. Unreachable/incomplete/permission-limited results block deployment approval.'
+
+    - name: Fail the discovery run when any required target lacks complete observation coverage
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].discovery_observation is defined
+          - not (hostvars[item].discovery_observation.failed | default(false))
+          - hostvars[item].discovery_observation.report | default({}) | length > 0
+          - hostvars[item].discovery_observation.report.coverage_complete | default(false)
+        fail_msg: 'Discovery is incomplete. Inspect the private report and resolve authentication, privileges, connectivity or coverage gaps. Do not bootstrap.'
+      loop: "{{ groups['target_vms'] }}"

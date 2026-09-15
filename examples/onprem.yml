@@ -1,0 +1,56 @@
+---
+# Overlay onto your complete HA inventory policy. No addresses are inferred.
+postgresql_version: '17'
+primary_node: pg1
+replica_nodes: [] # Read-only replicas, excluded from automatic promotion.
+standby_nodes: [pg2, pg3] # Promotion-eligible streaming standbys.
+replica_count: 0 # Counts are assertions against the explicit host lists.
+standby_count: 2
+enable_backup: false
+enable_haproxy: true # false requires an empty routers inventory group.
+allow_degraded_topology: false
+backup_target_path: null # Required only when backup is enabled; per-host override allowed.
+backup_schedule: '*-*-* 02:15:00 UTC'
+postgresql_extensions: [] # plpgsql baseline stays installed.
+postgresql_extension_registry: {} # Optional approved package/preload/dependency descriptors.
+postgresql_deployment:
+  mode: cluster
+  architecture: modular
+  major: '{{ postgresql_version }}'
+  allow_degraded_topology: '{{ allow_degraded_topology }}'
+  topology:
+    primary_count: 1 # One writable primary per physical replication cluster.
+    primary: '{{ primary_node }}'
+    replicas: '{{ replica_nodes }}'
+    standby: '{{ standby_nodes }}'
+    replica_count: '{{ replica_count }}'
+    standby_count: '{{ standby_count }}'
+  components:
+    backup: '{{ enable_backup }}'
+    haproxy: '{{ enable_haproxy }}'
+  extensions: '{{ postgresql_extensions }}'
+  extension_registry: '{{ postgresql_extension_registry }}'
+  extension_databases: [postgres]
+postgresql_operation: plan
+# Existing cluster policy must match these names and chosen durability mode.
+# With zero eligible standbys: use async, synchronous_node_count: 0 and explicit
+# acknowledge_async_data_loss: true in cluster.replication; no automatic HA claim.
+
+# Existing-cluster extension lifecycle; first provisioning uses postgresql.yml.
+extension_operation: plan
+extension_package_policy: pinned # Or installed_or_candidate from approved apt sources.
+postgresql_allow_package_install: false
+extension_allow_repository_changes: false
+extension_repositories: [] # Pre-provision verified signing keys; example in the guide.
+extension_allow_restart: false
+extension_allow_write_interruption: false
+extension_change_confirmation: '' # APPLY EXTENSIONS <observed system identifier>
+postgresql_instance:
+  socket_dir: /run/pg-ha-patroni
+  port: 5432
+  owner: postgres
+  expected_system_id: '' # Copy from discovery; never infer or change cluster identity.
+postgresql_package_versions: {} # Exact pins, including any selected custom packages.
+# Existing mounts can differ by server via host_vars. These are not disk-formatting flags.
+# storage_layout:
+#   root: /srv/pg-storage

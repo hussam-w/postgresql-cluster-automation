@@ -1,0 +1,264 @@
+---
+- ansible.builtin.import_playbook: model-validate.yml
+- ansible.builtin.import_playbook: inspect.yml
+- name: Discover and admit declarative extension maintenance
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require complete managed scope and explicit mutation identity
+      ansible.builtin.assert:
+        that:
+          - extension_operation | default('plan') in ['plan', 'apply']
+          - extension_package_policy | default('pinned') in ['pinned', 'installed_or_candidate']
+          - not reconciliation_blocked
+          - ansible_distribution == 'Ubuntu' and ansible_distribution_version == '22.04'
+          - postgresql_instance.expected_system_id is defined
+          - extension_operation | default('plan') != 'apply' or extension_change_confirmation | default('') == 'APPLY EXTENSIONS ' ~ postgresql_instance.expected_system_id
+    - name: Observe native extension availability and current identity
+      postgres_extensions:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+      register: extension_before
+    - name: Require exact cluster lineage and safe schema before installing packages
+      ansible.builtin.assert:
+        that:
+          - extension_before.report.identity.system_id == postgresql_instance.expected_system_id
+          - extension_before.report.identity.major | string == postgresql_deployment.major
+          - extension_before.report.blockers | reject('search', 'extension unavailable for the running server|shared_preload_libraries requires') | list | length == 0
+    - name: Inspect managed service ownership before allowing automated restarts
+      ansible.builtin.stat:
+        path: "{{ '/var/lib/pg-ha/identity.json' if postgresql_deployment.mode == 'cluster' else '/var/lib/pg-standalone-' ~ standalone.name ~ '.json' }}"
+      register: extension_owned
+    - name: Preserve unowned services instead of taking over their restarts
+      ansible.builtin.assert:
+        that: extension_owned.stat.exists and extension_owned.stat.isreg and not extension_owned.stat.islnk and extension_owned.stat.uid == 0 and not extension_owned.stat.wgrp and not extension_owned.stat.woth
+    - name: Capture primary and replica order without changing role assignments
+      ansible.builtin.set_fact:
+        extension_is_primary: '{{ not extension_before.report.identity.recovery }}'
+    - name: Require one primary and identical database lineage before any write
+      ansible.builtin.assert:
+        that:
+          - groups.postgres_cluster | map('extract', hostvars, 'extension_is_primary') | select('equalto', true) | list | length == 1
+          - groups.postgres_cluster | map('extract', hostvars, 'postgresql_instance') | map(attribute='expected_system_id') | unique | length == 1
+      run_once: true
+    - name: Report selected packages prerequisites and additive SQL plan
+      ansible.builtin.debug:
+        var: extension_before.report
+    - name: Require restart consent before installing extensions needing new preloads
+      ansible.builtin.assert:
+        that:
+          - extension_allow_restart | default(false) | bool
+          - extension_allow_write_interruption | default(false) | bool
+      when: extension_operation | default('plan') == 'apply' and (hostvars.localhost.deployment_model.extensions.preload | difference(extension_before.report.identity.preload.split(',') | map('trim') | list) | length > 0)
+    - name: Configure explicitly approved package sources
+      ansible.builtin.include_role:
+        name: extension_repositories
+      when: extension_operation | default('plan') == 'apply'
+    - name: Resolve exact versions from approved repository metadata when selected
+      extension_package_versions:
+        packages: '{{ hostvars.localhost.deployment_model.extensions.packages }}'
+      register: extension_candidates
+      when: extension_operation | default('plan') == 'apply' and extension_package_policy | default('pinned') == 'installed_or_candidate'
+    - name: Select effective package pins
+      ansible.builtin.set_fact:
+        extension_effective_pins: "{{ extension_candidates.versions if extension_package_policy | default('pinned') == 'installed_or_candidate' else (cluster | default({})).get('packages', {}) | combine(postgresql_package_versions | default({})) }}"
+      when: extension_operation | default('plan') == 'apply'
+    - name: Refuse mixed requested package versions across cluster nodes
+      ansible.builtin.assert:
+        that: groups.postgres_cluster | map('extract', hostvars, 'extension_effective_pins') | map('to_json', sort_keys=true) | unique | length == 1
+      run_once: true
+      when: extension_operation | default('plan') == 'apply'
+    - name: Resolve package transaction before any node installs packages
+      ansible.builtin.include_role:
+        name: packages_safe
+      vars:
+        component_packages: '{{ hostvars.localhost.deployment_model.extensions.packages }}'
+        component_package_versions: '{{ extension_effective_pins }}'
+        package_validation_only: true
+      when: extension_operation | default('plan') == 'apply'
+    - name: Install only missing approved packages on all nodes
+      ansible.builtin.include_role:
+        name: packages_safe
+      vars:
+        component_packages: '{{ hostvars.localhost.deployment_model.extensions.packages }}'
+        component_package_versions: '{{ extension_effective_pins }}'
+      when: extension_operation | default('plan') == 'apply'
+    - name: Recheck native control files and schemas after package resolution
+      postgres_extensions:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+      register: extension_installed
+      when: extension_operation | default('plan') == 'apply'
+    - name: Refuse schema and native dependency problems before changing preloads
+      ansible.builtin.assert:
+        that: extension_installed.report.blockers | reject('search', 'shared_preload_libraries requires') | list | length == 0
+      when: extension_operation | default('plan') == 'apply'
+    - name: Plan merged preload configuration after package installation
+      postgres_preload:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        expected_system_id: '{{ postgresql_instance.expected_system_id }}'
+        required: '{{ hostvars.localhost.deployment_model.extensions.preload }}'
+        manager: "{{ 'patroni' if postgresql_deployment.mode == 'cluster' else 'standalone' }}"
+        standalone_name: '{{ (standalone | default({})).get("name", "main") }}'
+        patroni_config: '{{ postgresql_instance.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}'
+      register: extension_preload
+      when: extension_operation | default('plan') == 'apply'
+    - name: Refuse inconsistent per-node preload requirements
+      ansible.builtin.assert:
+        that: groups.postgres_cluster | map('extract', hostvars, 'extension_preload') | map(attribute='report.desired') | map('to_json') | unique | length == 1
+      run_once: true
+      when: extension_operation | default('plan') == 'apply'
+    - name: Require maintenance-window consent before any preload change
+      ansible.builtin.assert:
+        that:
+          - not extension_preload.report.needs_restart or extension_allow_restart | default(false) | bool
+          - not extension_preload.report.needs_restart or extension_allow_write_interruption | default(false) | bool
+      when: extension_operation | default('plan') == 'apply'
+    - name: Apply the additive DCS or standalone preload plan once
+      postgres_preload:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        expected_system_id: '{{ postgresql_instance.expected_system_id }}'
+        required: '{{ hostvars.localhost.deployment_model.extensions.preload }}'
+        manager: "{{ 'patroni' if postgresql_deployment.mode == 'cluster' else 'standalone' }}"
+        standalone_name: '{{ (standalone | default({})).get("name", "main") }}'
+        patroni_config: '{{ postgresql_instance.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}'
+        operation: apply
+        allow_restart: '{{ extension_allow_restart | default(false) }}'
+        expected_plan_sha256: '{{ extension_preload.report.plan_sha256 }}'
+      when: extension_operation | default('plan') == 'apply' and extension_is_primary
+    - name: Queue replicas first
+      ansible.builtin.add_host:
+        name: '{{ item }}'
+        groups: extension_restart_order
+      loop: '{{ groups.postgres_cluster }}'
+      when: extension_operation | default('plan') == 'apply' and not hostvars[item].extension_is_primary
+    - name: Queue the primary last
+      ansible.builtin.add_host:
+        name: '{{ item }}'
+        groups: extension_restart_order
+      loop: '{{ groups.postgres_cluster }}'
+      when: extension_operation | default('plan') == 'apply' and hostvars[item].extension_is_primary
+- name: Restart only nodes needing preload activation one at a time
+  hosts: extension_restart_order
+  serial: 1
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Gate each restart on live cluster health
+      ansible.builtin.include_tasks: ../roles/extension_lifecycle/tasks/health.yml
+      when: extension_preload.report.needs_restart and postgresql_deployment.mode == 'cluster'
+    - name: Require managed restart admission
+      ansible.builtin.assert:
+        that:
+          - extension_allow_restart | default(false) | bool
+          - extension_allow_write_interruption | default(false) | bool
+      when: extension_preload.report.needs_restart
+    - name: Wait for Patroni to reload the staged preload configuration
+      community.postgresql.postgresql_query:
+        login_unix_socket: '{{ postgresql_instance.socket_dir }}'
+        login_port: '{{ postgresql_instance.port | default(5432) }}'
+        login_db: postgres
+        query: SELECT pending_restart FROM pg_settings WHERE name='shared_preload_libraries'
+      become_user: postgres
+      register: extension_pending
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: extension_pending is succeeded and extension_pending.query_result[0].pending_restart
+      when: extension_preload.report.needs_restart and postgresql_deployment.mode == 'cluster'
+    - name: Restart through Patroni instead of competing with its PostgreSQL management
+      ansible.builtin.command:
+        argv: [sudo, '-u', postgres, patronictl, '-c', '{{ postgresql_instance.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}', restart, '{{ cluster.name }}', '{{ inventory_hostname }}', '--force']
+      when: extension_preload.report.needs_restart and postgresql_deployment.mode == 'cluster'
+    - name: Require a managed standalone service name
+      ansible.builtin.assert:
+        that: standalone.name is match('^[a-zA-Z0-9_-]+$')
+      when: extension_preload.report.needs_restart and postgresql_deployment.mode == 'standalone'
+    - name: Restart the explicitly owned standalone service
+      ansible.builtin.systemd_service:
+        name: 'pg-standalone-{{ standalone.name }}.service'
+        state: restarted
+      when: extension_preload.report.needs_restart and postgresql_deployment.mode == 'standalone'
+    - name: Verify local identity and preload activation before advancing
+      postgres_preload:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        expected_system_id: '{{ postgresql_instance.expected_system_id }}'
+        required: '{{ hostvars.localhost.deployment_model.extensions.preload }}'
+        manager: "{{ 'patroni' if postgresql_deployment.mode == 'cluster' else 'standalone' }}"
+        standalone_name: '{{ (standalone | default({})).get("name", "main") }}'
+        patroni_config: '{{ postgresql_instance.patroni_config | default("/etc/pg-ha/patroni/patroni.yml") }}'
+      register: extension_activated
+      retries: 30
+      delay: 2
+      until: extension_activated is succeeded and not extension_activated.report.needs_restart
+    - name: Verify cluster health before advancing to the next member
+      ansible.builtin.include_tasks: ../roles/extension_lifecycle/tasks/health.yml
+      when: postgresql_deployment.mode == 'cluster'
+- name: Create and verify declared extensions after all nodes are ready
+  hosts: postgres_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Replan against the current writer after maintenance
+      postgres_extensions:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+      register: extension_ready
+      when: extension_operation | default('plan') == 'apply'
+    - name: Require all extension prerequisites before any database DDL
+      ansible.builtin.assert:
+        that: extension_ready.report.blockers | length == 0 and extension_ready.report.identity.system_id == postgresql_instance.expected_system_id
+      when: extension_operation | default('plan') == 'apply'
+    - name: Create missing extensions transactionally on the actual writer
+      postgres_extensions:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+        operation: apply
+        expected_system_id: '{{ postgresql_instance.expected_system_id }}'
+        expected_plan_sha256: '{{ extension_ready.report.plan_sha256 }}'
+        allow_create: true
+      when: extension_operation | default('plan') == 'apply' and not extension_ready.report.identity.recovery
+    - name: Verify extensions across every selected database and replica
+      postgres_extensions:
+        socket_dir: '{{ postgresql_instance.socket_dir }}'
+        port: '{{ postgresql_instance.port | default(5432) }}'
+        major: '{{ postgresql_deployment.major }}'
+        optional: '{{ postgresql_deployment.extensions | default([]) }}'
+        registry: '{{ postgresql_deployment.extension_registry | default({}) }}'
+        databases: '{{ postgresql_deployment.extension_databases | default(["postgres"]) }}'
+        schema: '{{ postgresql_extension_schema | default("postgres_extensions") }}'
+      register: extension_final
+      retries: 20
+      delay: 2
+      until: not extension_final.would_change and extension_final.report.blockers | length == 0
+      when: extension_operation | default('plan') == 'apply'

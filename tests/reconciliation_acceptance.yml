@@ -1,0 +1,133 @@
+---
+- name: Qualify reconciliation in a separately initialized disposable PostgreSQL instance
+  hosts: "{{ qa_host | mandatory }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  vars:
+    qa_root: /srv/postgres/reconcile-qa-20260913
+    qa_socket: /srv/postgres/reconcile-qa-20260913/socket
+    qa_data: /srv/postgres/reconcile-qa-20260913/data
+    qa_port: 55491
+  tasks:
+    - name: Require explicit isolated test creation
+      ansible.builtin.assert:
+        that: reconcile_test_confirmation | default('') == 'CREATE ISOLATED RECONCILIATION TEST'
+    - name: Inspect dedicated test path without altering it
+      ansible.builtin.stat:
+        path: '{{ qa_root }}'
+      register: qa_before
+    - name: Refuse to reuse or reinitialize any preexisting test directory
+      ansible.builtin.assert:
+        that: not qa_before.stat.exists
+    - name: Create new isolated directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+      loop: ['{{ qa_root }}', '{{ qa_socket }}']
+    - name: Initialize only the newly admitted test path
+      ansible.builtin.command:
+        argv: [/usr/lib/postgresql/17/bin/initdb, '-D', '{{ qa_data }}', '--no-locale', '--auth=peer']
+        creates: '{{ qa_data }}/PG_VERSION'
+      become_user: postgres
+    - name: Configure the new test instance with Unix sockets only
+      ansible.builtin.blockinfile:
+        path: '{{ qa_data }}/postgresql.conf'
+        block: |
+          listen_addresses = ''
+          port = {{ qa_port }}
+          unix_socket_directories = '{{ qa_socket }}'
+          shared_buffers = '32MB'
+          max_connections = 10
+        backup: true
+    - name: Run parameter acceptance with guaranteed test-server shutdown
+      block:
+        - name: Start only the isolated instance
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_ctl, '-D', '{{ qa_data }}', '-l', '{{ qa_root }}/server.log', '-w', start]
+          become_user: postgres
+        - name: Capture live test-server start identity
+          ansible.builtin.command:
+            argv: [/usr/bin/psql, '-X', '-h', '{{ qa_socket }}', '-p', '{{ qa_port | string }}', '-Atc', 'SELECT pg_postmaster_start_time()']
+          become_user: postgres
+          changed_when: false
+          register: qa_start
+        - name: Plan a reload change against native PostgreSQL
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            manager: standalone
+            parameters: {log_min_duration_statement: 250ms}
+          register: qa_plan
+        - name: Reject stale plan without changing the instance
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            manager: standalone
+            operation: apply
+            parameters: {log_min_duration_statement: 250ms}
+            allow_reload: true
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+            expected_plan_sha256: invalid
+          register: stale_result
+          ignore_errors: true
+        - name: Require safe stale-plan refusal
+          ansible.builtin.assert:
+            that: stale_result.failed and not stale_result.changed
+        - name: Apply the exact reviewed change
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            manager: standalone
+            operation: apply
+            parameters: {log_min_duration_statement: 250ms}
+            allow_reload: true
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+            expected_plan_sha256: '{{ qa_plan.report.plan_sha256 }}'
+            backup_root: /var/lib/pg-ha-reconcile-qa
+          register: qa_apply
+        - name: Reapply an equivalent desired value with the old token
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            manager: standalone
+            operation: apply
+            parameters: {log_min_duration_statement: 0.25s}
+            allow_reload: true
+            expected_system_id: '{{ qa_plan.report.identity.system_id }}'
+            expected_plan_sha256: '{{ qa_plan.report.plan_sha256 }}'
+            backup_root: /var/lib/pg-ha-reconcile-qa
+          register: qa_repeat
+        - name: Attempt a forbidden restart parameter
+          postgres_reconcile:
+            socket_dir: '{{ qa_socket }}'
+            port: '{{ qa_port }}'
+            manager: standalone
+            operation: apply
+            parameters: {shared_buffers: 64MB}
+          register: forbidden_result
+          ignore_errors: true
+        - name: Capture final test-server start identity
+          ansible.builtin.command:
+            argv: [/usr/bin/psql, '-X', '-h', '{{ qa_socket }}', '-p', '{{ qa_port | string }}', '-Atc', 'SELECT pg_postmaster_start_time()']
+          become_user: postgres
+          changed_when: false
+          register: qa_end
+        - name: Prove native apply idempotence and no restart
+          ansible.builtin.assert:
+            that:
+              - qa_apply.changed
+              - not qa_repeat.changed
+              - forbidden_result.failed and not forbidden_result.changed
+              - qa_start.stdout == qa_end.stdout
+              - qa_apply.backup_directory | length > 0
+      always:
+        - name: Stop only the isolated test instance and retain its evidence
+          ansible.builtin.command:
+            argv: [/usr/lib/postgresql/17/bin/pg_ctl, '-D', '{{ qa_data }}', '-m', fast, '-w', stop]
+          become_user: postgres
+          register: qa_stop
+          failed_when: qa_stop.rc != 0 and 'no server running' not in qa_stop.stderr

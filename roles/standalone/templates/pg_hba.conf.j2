@@ -1,0 +1,7 @@
+local all postgres peer
+local all all reject
+{% for cidr in standalone.client_cidrs %}
+hostssl all all {{ cidr }} scram-sha-256
+{% endfor %}
+host all all 0.0.0.0/0 reject
+host all all ::/0 reject

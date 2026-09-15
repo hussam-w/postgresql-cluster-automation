@@ -1,0 +1,15 @@
+---
+- name: Resolve optional storage layout for the existing policy
+  ansible.builtin.import_playbook: storage-resolve.yml
+
+- name: Validate controller-side inputs
+  ansible.builtin.import_playbook: validate-inputs.yml
+
+- name: Verify the complete managed inventory without applying changes
+  hosts: postgres_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  vars:
+    deployment_mode: verify
+  roles: [common, preflight, health]

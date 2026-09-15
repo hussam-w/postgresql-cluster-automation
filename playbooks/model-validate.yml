@@ -1,0 +1,45 @@
+---
+- name: Validate selected architecture topology and extensions before SSH
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require an explicit model and valid execution intent
+      ansible.builtin.assert:
+        that:
+          - postgresql_deployment is defined
+          - postgresql_version is not defined or postgresql_deployment.major == postgresql_version
+          - postgresql_operation | default('plan') in ['plan', 'provision', 'packages', 'configure', 'components']
+          - groups.get('postgres_cluster', []) | length > 0
+    - name: Validate the complete host-role mapping and extension registry
+      ansible.builtin.set_fact:
+        deployment_model_input: '{{ postgresql_deployment }}'
+        deployment_model: "{{ postgresql_deployment | validate_deployment_model(groups['postgres_cluster'], groups.get('etcd_cluster', []), groups.get('routers', [])) }}"
+    - name: Refuse invalid topology before any host changes
+      ansible.builtin.assert:
+        that: deployment_model.errors | length == 0
+        fail_msg: '{{ deployment_model.errors }}'
+    - name: Report effective topology and required extension components
+      ansible.builtin.debug:
+        var: deployment_model
+    - name: Require consistent explicit environment component overrides
+      ansible.builtin.assert:
+        that:
+          - postgresql_extensions is not defined or postgresql_deployment.extensions == postgresql_extensions
+          - enable_backup is not defined or deployment_model.components.backup == enable_backup
+          - enable_haproxy is not defined or deployment_model.components.haproxy == enable_haproxy
+    - name: Require backup destinations before provisioning any databases
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].backup_target_path is defined
+          - hostvars[item].backup_target_path is string
+          - hostvars[item].backup_target_path | length > 1
+      loop: '{{ groups.postgres_cluster }}'
+      when: deployment_model.components.backup and postgresql_operation | default('plan') in ['provision', 'components']
+    - name: Reject conflicting PostgreSQL package majors before SSH
+      ansible.builtin.assert:
+        that: (postgresql_deployment | postgres_major((hostvars[item].cluster | default({})).get('packages', {}))) == postgresql_deployment.major
+      loop: '{{ groups.postgres_cluster }}'
+      when: postgresql_deployment.mode == 'cluster'
